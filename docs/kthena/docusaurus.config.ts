@@ -9,18 +9,28 @@ import rehypeKatex from 'rehype-katex';
 const config: Config = {
   title: 'Kthena',
   tagline: 'Kubernetes-native AI serving platform for scalable model serving',
-  favicon: 'img/volcano-logo.png',
+  favicon: 'img/kthena-logo/icon/colour/kthena-icon-color.svg',
 
   // Future flags, see https://docusaurus.io/docs/api/docusaurus-config#future
   future: {
     v4: true, // Improve compatibility with the upcoming Docusaurus v4
   },
 
+  headTags: [
+    {
+      tagName: 'meta',
+      attributes: {
+        name: 'algolia-site-verification',
+        content: '363A58E1807B6EF0',
+      },
+    },
+  ],
+
   // Set the production url of your site here
-  url: 'https://volcano-sh.github.io',
+  url: 'https://kthena.volcano.sh',
   // Set the /<baseUrl>/ pathname under which your site is served
   // For GitHub pages deployment, it is often '/<projectName>/'
-  baseUrl: '/kthena',
+  baseUrl: '/',
 
   // GitHub pages deployment config.
   // If you aren't using GitHub pages, you don't need these.
@@ -73,6 +83,7 @@ const config: Config = {
           rehypePlugins: [rehypeKatex],
         },
         blog: {
+          blogSidebarCount: 'ALL',
           showReadingTime: true,
           feedOptions: {
             type: ['rss', 'atom'],
@@ -94,14 +105,16 @@ const config: Config = {
     ],
   ],
 
+  themes: ['@docusaurus/theme-mermaid'],
+
   themeConfig: {
     // Replace with your project's social card
-    image: 'img/volcano-logo.svg',
+    image: 'img/kthena-logo/horizontal/colour/Kthena-horizontal-color.svg',
     navbar: {
       title: 'Kthena',
       logo: {
         alt: 'Kthena Logo',
-        src: 'img/volcano-logo.png',
+        src: 'img/kthena-logo/icon/colour/kthena-icon-color.svg',
       },
       items: [
         {
@@ -111,6 +124,9 @@ const config: Config = {
           label: 'Tutorial',
         },
         { to: '/blog', label: 'Blog', position: 'left' },
+        {
+          type: 'docsVersionDropdown',
+        },
         {
           href: 'https://github.com/volcano-sh/kthena',
           label: 'GitHub',
@@ -166,6 +182,29 @@ const config: Config = {
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
+    },
+    algolia: {
+      // The application ID provided by Algolia
+      appId: 'KWQGHZRPIK',
+
+      // Public API key: it is safe to commit it
+      apiKey: 'f58be992d82f553447f32a95a27ed8a4',
+
+      indexName: 'Kthena Documentation Crawler',
+
+      // Optional: see doc section below
+      contextualSearch: true,
+
+      // Optional: path for search page that enabled by default (`false` to disable it)
+      searchPagePath: 'search',
+
+      // Optional: whether the insights feature is enabled or not on Docsearch (`false` by default)
+      insights: false,
+
+      // Optional: whether you want to use the new Ask AI feature (undefined by default)
+      askAi: 'xv1HgWgFfA4q',
+
+      //... other Algolia params
     },
   } satisfies Preset.ThemeConfig,
 };

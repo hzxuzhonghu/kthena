@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 )
 
 // hashModelKey represents a composite key combining hash and model name
@@ -78,12 +79,6 @@ type ModelPrefixStore struct {
 	hashCapacity int                                                    // Capacity for each pod's hash LRU
 }
 
-// MatchResult represents a matching pod and its match length
-type MatchResult struct {
-	NamespacedName types.NamespacedName
-	MatchLen       int
-}
-
 // NewModelPrefixStore creates a new ModelPrefixStore with the specified capacity and topK
 func NewModelPrefixStore(store datastore.Store, hashCapacity, topK int) *ModelPrefixStore {
 	s := &ModelPrefixStore{
@@ -120,14 +115,11 @@ func (s *ModelPrefixStore) onPodDeleted(data datastore.EventData) {
 		for model, hashSlice := range hashByModel {
 			s.onHashEvicted(model, hashSlice, data.Pod)
 			// check whether we need to delete entries
-			s.entriesMu.RLock()
-			modelCache, exists := s.entries[model]
-			s.entriesMu.RUnlock()
-			if exists && isModelHashShardEmpty(modelCache) {
-				s.entriesMu.Lock()
+			s.entriesMu.Lock()
+			if modelCache, exists := s.entries[model]; exists && isModelHashShardEmpty(modelCache) {
 				delete(s.entries, model)
-				s.entriesMu.Unlock()
 			}
+			s.entriesMu.Unlock()
 		}
 	}
 }
@@ -144,10 +136,10 @@ func isModelHashShardEmpty(model *modelHashes) bool {
 	return true
 }
 
-// FindTopMatches finds the topK pods with the longest matching prefixes for given model and hashes
-func (s *ModelPrefixStore) FindTopMatches(model string, hashes []uint64, pods []*datastore.PodInfo) []MatchResult {
-	matches := make([]MatchResult, 0, s.topK)
-
+// FindTopMatches finds the topK pods with the longest matching prefixes for given model and hashes.
+// Only pods present in the pods argument are considered as candidates.
+// It returns a map of NamespacedName to match length for the topK matching pods.
+func (s *ModelPrefixStore) FindTopMatches(model string, hashes []uint64, pods []*datastore.PodInfo) map[types.NamespacedName]int {
 	s.entriesMu.RLock()
 	modelCache, exists := s.entries[model]
 	s.entriesMu.RUnlock()
@@ -156,8 +148,14 @@ func (s *ModelPrefixStore) FindTopMatches(model string, hashes []uint64, pods []
 		return nil
 	}
 
-	// Track processed pods to avoid duplicates
-	processedPods := sets.New[types.NamespacedName]()
+	// Build a set of candidate pods from the pods argument so that only
+	// pods in the scheduling candidate pool are returned.
+	candidatePods := sets.New[types.NamespacedName]()
+	for _, pod := range pods {
+		candidatePods.Insert(pod.GetPodNamespacedName())
+	}
+
+	matches := make(map[types.NamespacedName]int, s.topK)
 
 	// Start matching from the end of hashes
 	// This works because each hash depends on the previous hash in hashPrompt
@@ -169,20 +167,17 @@ func (s *ModelPrefixStore) FindTopMatches(model string, hashes []uint64, pods []
 		if exists {
 			// Note: we are iterating over a copy of the set, so we don't need to hold the lock.
 			for pod := range podSet {
-				// Skip if pod is not in the candidate set or already processed
-				if processedPods.Contains(pod) {
+				// Skip if pod is not in the candidate set or already matched
+				if !candidatePods.Contains(pod) {
 					continue
 				}
-				processedPods.Insert(pod)
+				if _, alreadyMatched := matches[pod]; alreadyMatched {
+					continue
+				}
 
 				// If we found a match at position i, we know all previous hashes must match
 				// because each hash depends on the previous one in hashPrompt
-				matchLen := i + 1
-
-				matches = append(matches, MatchResult{
-					NamespacedName: pod,
-					MatchLen:       matchLen,
-				})
+				matches[pod] = i + 1
 
 				// Return if we have enough matches
 				if len(matches) >= s.topK {
@@ -199,17 +194,17 @@ func (s *ModelPrefixStore) FindTopMatches(model string, hashes []uint64, pods []
 
 // Add adds new hash->pod mappings to cache, using LRU for eviction
 func (s *ModelPrefixStore) Add(model string, hashes []uint64, pod *datastore.PodInfo) {
-	nsName := types.NamespacedName{
-		Namespace: pod.Pod.Namespace,
-		Name:      pod.Pod.Name,
-	}
+	nsName := pod.GetPodNamespacedName()
 
 	s.podHashesMu.Lock()
 	podLRU, exists := s.podHashes[nsName]
 	if !exists {
 		podLRU, _ = NewLRUCache(s.hashCapacity, func(key hashModelKey, value struct{}) {
-			// onEvict callback need to acquire `modelCache.mu.Lock()` as well, so start a goroutine to run it async.
-			go s.onHashEvicted(key.model, []uint64{key.hash}, nsName)
+			// Only capacity-driven evictions reach this callback; pod deletion removes
+			// entries via onHashEvicted directly, so this is the right place to count them.
+			metrics.DefaultMetrics.RecordPrefixCacheEviction(key.model)
+			// Safe to call synchronously: podLRU.Add() is invoked after shard.mu.Unlock().
+			s.onHashEvicted(key.model, []uint64{key.hash}, nsName)
 		})
 		s.podHashes[nsName] = podLRU
 	}
@@ -238,6 +233,17 @@ func (s *ModelPrefixStore) Add(model string, hashes []uint64, pod *datastore.Pod
 		shard.mu.Unlock()
 		podLRU.Add(hashModelKey{hash: hash, model: model}, struct{}{})
 	}
+}
+
+// EntryCount sums the number of (block-hash, pod) entries across all per-pod caches; read by the prefix_cache_entries gauge at scrape time.
+func (s *ModelPrefixStore) EntryCount() float64 {
+	s.podHashesMu.RLock()
+	defer s.podHashesMu.RUnlock()
+	total := 0
+	for _, podLRU := range s.podHashes {
+		total += podLRU.Len()
+	}
+	return float64(total)
 }
 
 // onHashEvicted handles the eviction of a hash from a pod's LRU cache

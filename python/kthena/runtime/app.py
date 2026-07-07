@@ -32,10 +32,14 @@ from kthena.downloader.app import load_config
 from kthena.downloader.downloader import download_model
 from kthena.runtime.collect import process_metrics
 from kthena.runtime.events import get_event_publisher, EventType
-from kthena.runtime.kv_cache_manager import get_vllm_kv_cache_handler
+from kthena.runtime.kv_cache_manager import (
+    get_vllm_kv_cache_handler,
+    get_sglang_kv_cache_handler,
+)
 from kthena.runtime.redis_client import get_redis_client
-from kthena.runtime.standard import MetricStandard
+from kthena.runtime.standard import MetricStandard, EngineType
 from kthena.runtime.zmq_subscriber import get_vllm_zmq_subscriber
+from kthena.runtime.sglang_zmq_subscriber import get_sglang_zmq_subscriber
 
 
 class AppState:
@@ -44,6 +48,7 @@ class AppState:
         self.redis_client = None
         self.event_publisher = None
         self.vllm_zmq_subscriber = None
+        self.sglang_zmq_subscriber = None
         self.metric_standard: Optional[MetricStandard] = None
         self.engine_metrics_url: Optional[str] = None
         self.pod_identifier: Optional[str] = None
@@ -53,6 +58,20 @@ class AppState:
 TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30.0"))
 
 logging.basicConfig(level=logging.INFO)
+
+
+def _log_subscriber_task_exception(name: str):
+    def _callback(task: "asyncio.Task") -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logging.getLogger(__name__).error(
+                "%s background task exited with exception: %s", name, exc, exc_info=exc)
+
+    return _callback
+
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -83,7 +102,7 @@ async def lifespan(app: FastAPI):
         state.redis_client = redis_client
         logger.info("Redis client initialized successfully")
     except Exception as e:
-        logger.warning(f"Failed to initialize Redis client: {e}")
+        logger.warning("Failed to initialize Redis client:%s",e)
         state.redis_client = None
 
     try:
@@ -93,19 +112,26 @@ async def lifespan(app: FastAPI):
         pod_identifier = state.pod_identifier
         model_name = state.model_name
 
-        if pod_identifier and model_name:
-            vllm_kv_cache_handler = get_vllm_kv_cache_handler()
+        engine = state.metric_standard.engine if state.metric_standard else None
 
-            event_types = [
+        if pod_identifier and model_name and engine == EngineType.VLLM:
+            vllm_kv_cache_handler = get_vllm_kv_cache_handler()
+            for event_type in (
                 EventType.VLLM_BLOCK_STORED,
                 EventType.VLLM_BLOCK_REMOVED,
-                EventType.VLLM_ALL_BLOCKS_CLEARED
-            ]
-
-            for event_type in event_types:
+                EventType.VLLM_ALL_BLOCKS_CLEARED,
+            ):
                 event_publisher.subscribe(event_type, vllm_kv_cache_handler)
-
-            logger.info("Event handlers registered successfully")
+            logger.info("vLLM KV-cache event handler registered")
+        elif pod_identifier and model_name and engine == EngineType.SGLANG:
+            sglang_kv_cache_handler = get_sglang_kv_cache_handler()
+            for event_type in (
+                EventType.SGLANG_BLOCK_STORED,
+                EventType.SGLANG_BLOCK_REMOVED,
+                EventType.SGLANG_ALL_BLOCKS_CLEARED,
+            ):
+                event_publisher.subscribe(event_type, sglang_kv_cache_handler)
+            logger.info("SGLang KV-cache event handler registered")
         else:
             logger.info("Pod identifier or model name not provided, skipping event handler registration")
 
@@ -113,13 +139,14 @@ async def lifespan(app: FastAPI):
         logger.info("Event publisher started successfully")
 
     except Exception as e:
-        logger.error(f"Failed to initialize event system: {e}")
+        logger.error("Failed to initialize event system: %s",e )
         state.event_publisher = None
 
     state.vllm_zmq_subscriber = None
+    state.sglang_zmq_subscriber = None
 
     if (state.metric_standard and
-            state.metric_standard.engine == 'vllm' and
+            state.metric_standard.engine == EngineType.VLLM and
             state.pod_identifier and
             state.model_name):
 
@@ -128,11 +155,27 @@ async def lifespan(app: FastAPI):
                 state.pod_identifier,
                 state.model_name
             )
-            asyncio.create_task(vllm_zmq_subscriber.start())
+            vllm_task = asyncio.create_task(vllm_zmq_subscriber.start())
+            vllm_task.add_done_callback(_log_subscriber_task_exception("vLLM ZMQ subscriber"))
             state.vllm_zmq_subscriber = vllm_zmq_subscriber
             logger.info("vLLM ZMQ subscriber initialized successfully")
         except Exception as e:
-            logger.warning(f"Failed to initialize vLLM ZMQ subscriber: {e}")
+            logger.warning("Failed to initialize vLLM ZMQ subscriber: %s", e)
+    elif (state.metric_standard and
+          state.metric_standard.engine == EngineType.SGLANG and
+          state.pod_identifier and
+          state.model_name):
+        try:
+            sglang_zmq_subscriber = get_sglang_zmq_subscriber(
+                state.pod_identifier,
+                state.model_name
+            )
+            sglang_task = asyncio.create_task(sglang_zmq_subscriber.start())
+            sglang_task.add_done_callback(_log_subscriber_task_exception("SGLang ZMQ subscriber"))
+            state.sglang_zmq_subscriber = sglang_zmq_subscriber
+            logger.info("SGLang ZMQ subscriber initialized successfully")
+        except Exception as e:
+            logger.warning("Failed to initialize SGLang ZMQ subscriber: %s", e)
 
     yield
 
@@ -140,6 +183,9 @@ async def lifespan(app: FastAPI):
 
     if state.vllm_zmq_subscriber:
         cleanup_tasks.append(('vLLM ZMQ subscriber', state.vllm_zmq_subscriber.stop()))
+
+    if state.sglang_zmq_subscriber:
+        cleanup_tasks.append(('SGLang ZMQ subscriber', state.sglang_zmq_subscriber.stop()))
 
     if state.event_publisher:
         cleanup_tasks.append(('Event system', state.event_publisher.stop()))
@@ -187,13 +233,13 @@ async def get_metrics(request: Request) -> Response:
         )
 
     except httpx.HTTPError as e:
-        logger.error(f"Failed to fetch metrics: {e}")
+        logger.error("Failed to fetch metrics: %s",e)
         raise HTTPException(
             status_code=502,
             detail=f"Failed to fetch metrics from engine: {str(e)}"
         )
     except Exception as e:
-        logger.error(f"Error processing metrics: {e}")
+        logger.error("Error processing metrics: %s",e)
         raise HTTPException(
             status_code=500,
             detail=f"Error processing metrics: {str(e)}"
@@ -212,11 +258,11 @@ def create_application(args: argparse.Namespace) -> FastAPI:
 
     app.include_router(router)
 
-    logger.info(f"Application configured for engine: {args.engine}")
-    logger.info(f"Engine base URL: {args.engine_base_url}")
-    logger.info(f"Engine metrics URL: {args.engine_base_url + args.engine_metrics_path}")
-    logger.info(f"Pod: {args.pod}")
-    logger.info(f"Model: {args.model}")
+    logger.info("Application configured for engine: %s", args.engine)
+    logger.info("Engine base URL: %s", args.engine_base_url)
+    logger.info("Engine metrics URL: %s%s", args.engine_base_url, args.engine_metrics_path)
+    logger.info("Pod: %s", args.pod)
+    logger.info("Model: %s", args.model)
 
     return app
 
@@ -284,7 +330,7 @@ def main() -> None:
         args = parse_arguments()
         app = create_application(args)
 
-        logger.info(f"Starting service on {args.host}:{args.port}")
+        logger.info("Starting service on %s:%s", args.host, args.port)
 
         uvicorn.run(
             app,
@@ -296,7 +342,7 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Service stopped by user")
     except Exception as e:
-        logger.error(f"Failed to start service: {e}")
+        logger.error("Failed to start service: %s",e)
         raise
 
 
@@ -304,7 +350,7 @@ def main() -> None:
 async def load_lora_adapter(request: Request, background_tasks: BackgroundTasks) -> JSONResponse:
     """
     Load LoRA adapter with integrated download capability.
-    
+
     Request body should contain:
     - lora_name: str - Name of the LoRA adapter
     - source: str (optional) - Source URL for downloading (s3://, obs://, pvc://, or HuggingFace)
@@ -329,7 +375,7 @@ async def load_lora_adapter(request: Request, background_tasks: BackgroundTasks)
             try:
                 logger.info(f"Downloading LoRA adapter from {source} to {output_dir}")
                 download_model(source, output_dir, config, max_workers)
-                logger.info(f"LoRA adapter download completed: {source} -> {output_dir}")
+                logger.info("LoRA adapter download completed: %s -> %s", source, output_dir)
 
                 # Load the adapter
                 load_body = {
@@ -348,7 +394,7 @@ async def load_lora_adapter(request: Request, background_tasks: BackgroundTasks)
                     return response.json()
 
             except Exception as e:
-                logger.error(f"Error in download and load task: {e}")
+                logger.error("Error in download and load task: %s",e)
                 raise
 
         if async_download:
@@ -387,7 +433,7 @@ async def load_lora_adapter(request: Request, background_tasks: BackgroundTasks)
 
             try:
                 response_content = response.json()
-            except (json.JSONDecodeError, ValueError) as e:
+            except (json.JSONDecodeError, ValueError):
                 response_content = {"message": response.text}
 
             return JSONResponse(content=response_content, status_code=response.status_code)
@@ -412,7 +458,7 @@ async def unload_lora_adapter(request: Request) -> JSONResponse:
 
         try:
             response_content = response.json()
-        except (json.JSONDecodeError, ValueError) as e:
+        except (json.JSONDecodeError, ValueError):
             response_content = {"message": response.text}
 
         return JSONResponse(content=response_content, status_code=response.status_code)
@@ -427,7 +473,7 @@ async def unload_lora_adapter(request: Request) -> JSONResponse:
 async def download_model_endpoint(request: Request, background_tasks: BackgroundTasks) -> JSONResponse:
     """
     Download model from various sources (S3, OBS, PVC, HuggingFace)
-    
+
     Request body should contain:
     - source: str - Model source URL (s3://, obs://, pvc://, or HuggingFace model name)
     - output_dir: str - Local directory to save the model

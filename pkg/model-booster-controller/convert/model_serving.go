@@ -44,44 +44,43 @@ const (
 	URIPrefixSeparator             = "://"
 	VllmTemplatePath               = "templates/vllm.yaml"
 	VllmDisaggregatedTemplatePath  = "templates/vllm-pd.yaml"
-	VllmMultiNodeServingScriptPath = "/vllm-workspace/vllm/examples/online_serving/multi-node-serving.sh"
+	VllmMultiNodeServingScriptPath = "examples/online_serving/multi-node-serving.sh"
 	modelRouteRuleName             = "default"
+	// /dev/shm is too small to support NCCL, we need a larger memory volume
+	dshm = "dshm"
 )
 
 //go:embed templates/*
 var templateFS embed.FS
 
-// BuildModelServing creates ModelServing objects based on the model's backends.
-func BuildModelServing(model *workload.ModelBooster) ([]*workload.ModelServing, error) {
-	var servings []*workload.ModelServing
-	for idx, backend := range model.Spec.Backends {
-		var serving *workload.ModelServing
-		var err error
-		switch backend.Type {
-		case workload.ModelBackendTypeVLLM:
-			serving, err = buildVllmModelServing(model, idx)
-		case workload.ModelBackendTypeVLLMDisaggregated:
-			serving, err = buildVllmDisaggregatedModelServing(model, idx)
-		default:
-			return nil, fmt.Errorf("not support model backend type: %s", backend.Type)
-		}
-		if err != nil {
-			return nil, err
-		}
-		servings = append(servings, serving)
+// BuildModelServing creates a ModelServing object based on the model's backend.
+func BuildModelServing(model *workload.ModelBooster) (*workload.ModelServing, error) {
+	backend := &model.Spec.Backend
+	var serving *workload.ModelServing
+	var err error
+	switch backend.Type {
+	case workload.ModelBackendTypeVLLM:
+		serving, err = buildVllmModelServing(model)
+	case workload.ModelBackendTypeVLLMDisaggregated:
+		serving, err = buildVllmDisaggregatedModelServing(model)
+	default:
+		return nil, fmt.Errorf("not support model backend type: %s", backend.Type)
 	}
-	return servings, nil
+	if err != nil {
+		return nil, err
+	}
+	return serving, nil
 }
 
 // buildVllmDisaggregatedModelServing handles VLLM disaggregated backend creation.
-func buildVllmDisaggregatedModelServing(model *workload.ModelBooster, idx int) (*workload.ModelServing, error) {
-	backend := &model.Spec.Backends[idx]
+func buildVllmDisaggregatedModelServing(model *workload.ModelBooster) (*workload.ModelServing, error) {
+	backend := &model.Spec.Backend
 	workersMap := mapWorkers(backend.Workers)
 	if workersMap[workload.ModelWorkerTypePrefill] == nil {
-		return nil, fmt.Errorf("prefill worker not found in backend: %s", backend.Name)
+		return nil, fmt.Errorf("prefill worker not found in backend")
 	}
 	if workersMap[workload.ModelWorkerTypeDecode] == nil {
-		return nil, fmt.Errorf("decode worker not found in backend: %s", backend.Name)
+		return nil, fmt.Errorf("decode worker not found in backend")
 	}
 	cacheVolume, err := buildCacheVolume(backend)
 	if err != nil {
@@ -102,6 +101,18 @@ func buildVllmDisaggregatedModelServing(model *workload.ModelBooster, idx int) (
 	})
 	if len(hfEndpointEnvVars) > 0 && hfEndpointEnvVars[0].Value != "" {
 		envVars = append(envVars, hfEndpointEnvVars[0])
+	}
+	msTokenEnvVars := env.GetEnvValueOrDefault[[]corev1.EnvVar](backend, env.MsToken, []corev1.EnvVar{
+		{Name: env.MsToken},
+	})
+	if len(msTokenEnvVars) > 0 && msTokenEnvVars[0].Value != "" {
+		envVars = append(envVars, msTokenEnvVars[0])
+	}
+	msRevisionEnvVars := env.GetEnvValueOrDefault[[]corev1.EnvVar](backend, env.MsRevision, []corev1.EnvVar{
+		{Name: env.MsRevision},
+	})
+	if len(msRevisionEnvVars) > 0 && msRevisionEnvVars[0].Value != "" {
+		envVars = append(envVars, msRevisionEnvVars[0])
 	}
 	initContainers := []corev1.Container{
 		{
@@ -124,24 +135,16 @@ func buildVllmDisaggregatedModelServing(model *workload.ModelBooster, idx int) (
 	var decodeCommand []string
 	for _, worker := range backend.Workers {
 		if worker.Type == workload.ModelWorkerTypePrefill {
-			preFillCommand, err = buildCommands(&worker.Config, modelDownloadPath, workersMap)
+			preFillCommand, err = buildCommands(backend, &worker.Config, modelDownloadPath, workersMap)
 			if err != nil {
 				return nil, err
 			}
 		} else if worker.Type == workload.ModelWorkerTypeDecode {
-			decodeCommand, err = buildCommands(&worker.Config, modelDownloadPath, workersMap)
+			decodeCommand, err = buildCommands(backend, &worker.Config, modelDownloadPath, workersMap)
 			if err != nil {
 				return nil, err
 			}
 		}
-	}
-
-	// Handle LoRA adapters
-	if len(backend.LoraAdapters) > 0 {
-		loraCommands, loraContainers := buildLoraComponents(model, backend, cacheVolume.Name)
-		preFillCommand = append(preFillCommand, loraCommands...)
-		decodeCommand = append(decodeCommand, loraCommands...)
-		initContainers = append(initContainers, loraContainers...)
 	}
 
 	prefillEngineEnv := buildEngineEnvVars(backend,
@@ -164,12 +167,7 @@ func buildVllmDisaggregatedModelServing(model *workload.ModelBooster, idx int) (
 			Namespace: model.Namespace,
 			Labels:    utils.GetModelControllerLabels(model, backend.Name, icUtils.Revision(backend)),
 			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: workload.GroupVersion.String(),
-					Kind:       workload.ModelKind.Kind,
-					Name:       model.Name,
-					UID:        model.UID,
-				},
+				utils.NewModelOwnerRef(model),
 			},
 		},
 		"VOLUME_MOUNTS": []corev1.VolumeMount{{
@@ -179,12 +177,15 @@ func buildVllmDisaggregatedModelServing(model *workload.ModelBooster, idx int) (
 		"VOLUMES": []*corev1.Volume{
 			cacheVolume,
 		},
-		"MODEL_NAME":                         model.Name,
-		"BACKEND_REPLICAS":                   backend.MinReplicas, // todo: backend replicas
-		"INIT_CONTAINERS":                    initContainers,
-		"MODEL_DOWNLOAD_ENVFROM":             backend.EnvFrom,
-		"ENGINE_PREFILL_COMMAND":             preFillCommand,
-		"ENGINE_DECODE_COMMAND":              decodeCommand,
+		"MODEL_NAME":             model.Name,
+		"BACKEND_REPLICAS":       backend.Replicas,
+		"INIT_CONTAINERS":        initContainers,
+		"MODEL_DOWNLOAD_ENVFROM": backend.EnvFrom,
+		"ENGINE_PREFILL_COMMAND": preFillCommand,
+		"ENGINE_DECODE_COMMAND":  decodeCommand,
+		"SERVER_ENTRY_TEMPLATE_METADATA": &metav1.ObjectMeta{
+			Labels: utils.GetModelControllerLabels(model, backend.Name, icUtils.Revision(backend)),
+		},
 		"MODEL_SERVING_RUNTIME_IMAGE":        config.Config.RuntimeImage(),
 		"MODEL_SERVING_RUNTIME_PORT":         env.GetEnvValueOrDefault[int32](backend, env.RuntimePort, 8100),
 		"MODEL_SERVING_RUNTIME_URL":          env.GetEnvValueOrDefault[string](backend, env.RuntimeUrl, "http://localhost:8000"),
@@ -199,13 +200,19 @@ func buildVllmDisaggregatedModelServing(model *workload.ModelBooster, idx int) (
 		"ENGINE_DECODE_IMAGE":                workersMap[workload.ModelWorkerTypeDecode].Image,
 		"ENGINE_PREFILL_RESOURCES":           workersMap[workload.ModelWorkerTypePrefill].Resources,
 		"ENGINE_PREFILL_IMAGE":               workersMap[workload.ModelWorkerTypePrefill].Image,
+		"SCHEDULER_NAME":                     backend.SchedulerName,
+		"RUNTIME_CLASS_NAME":                 backend.RuntimeClassName,
+		"PREFILL_AFFINITY":                   workersMap[workload.ModelWorkerTypePrefill].Affinity,
+		"DECODE_AFFINITY":                    workersMap[workload.ModelWorkerTypeDecode].Affinity,
+		"PREFILL_TOLERATIONS":                workersMap[workload.ModelWorkerTypePrefill].Tolerations,
+		"DECODE_TOLERATIONS":                 workersMap[workload.ModelWorkerTypeDecode].Tolerations,
 	}
 	return loadModelServingTemplate(VllmDisaggregatedTemplatePath, &data)
 }
 
 // buildVllmModelServing handles VLLM backend creation.
-func buildVllmModelServing(model *workload.ModelBooster, idx int) (*workload.ModelServing, error) {
-	backend := &model.Spec.Backends[idx]
+func buildVllmModelServing(model *workload.ModelBooster) (*workload.ModelServing, error) {
+	backend := &model.Spec.Backend
 	workersMap := mapWorkers(backend.Workers)
 	if workersMap[workload.ModelWorkerTypeServer] == nil {
 		return nil, fmt.Errorf("server worker not found in backend: %s", backend.Name)
@@ -216,7 +223,7 @@ func buildVllmModelServing(model *workload.ModelBooster, idx int) (*workload.Mod
 	}
 	modelDownloadPath := GetCachePath(backend.CacheURI) + GetMountPath(backend.ModelURI)
 	// only one worker in such circumstance so get the first worker's config as commands
-	commands, err := buildCommands(&backend.Workers[0].Config, modelDownloadPath, workersMap)
+	commands, err := buildCommands(backend, &backend.Workers[0].Config, modelDownloadPath, workersMap)
 	if err != nil {
 		return nil, err
 	}
@@ -235,6 +242,18 @@ func buildVllmModelServing(model *workload.ModelBooster, idx int) (*workload.Mod
 	if len(hfEndpointEnvVars) > 0 && hfEndpointEnvVars[0].Value != "" {
 		envVars = append(envVars, hfEndpointEnvVars[0])
 	}
+	msTokenEnvVars := env.GetEnvValueOrDefault[[]corev1.EnvVar](backend, env.MsToken, []corev1.EnvVar{
+		{Name: env.MsToken},
+	})
+	if len(msTokenEnvVars) > 0 && msTokenEnvVars[0].Value != "" {
+		envVars = append(envVars, msTokenEnvVars[0])
+	}
+	msRevisionEnvVars := env.GetEnvValueOrDefault[[]corev1.EnvVar](backend, env.MsRevision, []corev1.EnvVar{
+		{Name: env.MsRevision},
+	})
+	if len(msRevisionEnvVars) > 0 && msRevisionEnvVars[0].Value != "" {
+		envVars = append(envVars, msRevisionEnvVars[0])
+	}
 	initContainers := []corev1.Container{
 		{
 			Name:  model.Name + "-model-downloader",
@@ -252,12 +271,6 @@ func buildVllmModelServing(model *workload.ModelBooster, idx int) (*workload.Mod
 		},
 	}
 
-	// Handle LoRA adapters
-	if len(backend.LoraAdapters) > 0 {
-		loraCommands, loraContainers := buildLoraComponents(model, backend, cacheVolume.Name)
-		commands = append(commands, loraCommands...)
-		initContainers = append(initContainers, loraContainers...)
-	}
 	engineEnv := buildEngineEnvVars(backend)
 	data := map[string]interface{}{
 		"MODEL_SERVING_TEMPLATE_METADATA": &metav1.ObjectMeta{
@@ -265,17 +278,12 @@ func buildVllmModelServing(model *workload.ModelBooster, idx int) (*workload.Mod
 			Namespace: model.Namespace,
 			Labels:    utils.GetModelControllerLabels(model, backend.Name, icUtils.Revision(backend)),
 			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: workload.GroupVersion.String(),
-					Kind:       workload.ModelKind.Kind,
-					Name:       model.Name,
-					UID:        model.UID,
-				},
+				utils.NewModelOwnerRef(model),
 			},
 		},
 		"MODEL_NAME":       model.Name,
 		"BACKEND_NAME":     strings.ToLower(backend.Name),
-		"BACKEND_REPLICAS": backend.MinReplicas, // todo: backend replicas
+		"BACKEND_REPLICAS": backend.Replicas,
 		"BACKEND_TYPE":     strings.ToLower(string(backend.Type)),
 		"ENGINE_ENV":       engineEnv,
 		"WORKER_ENV":       backend.Env,
@@ -283,13 +291,26 @@ func buildVllmModelServing(model *workload.ModelBooster, idx int) (*workload.Mod
 		"SERVER_ENTRY_TEMPLATE_METADATA": &metav1.ObjectMeta{
 			Labels: utils.GetModelControllerLabels(model, backend.Name, icUtils.Revision(backend)),
 		},
-		"SERVER_WORKER_TEMPLATE_METADATA": nil,
+		"SERVER_WORKER_TEMPLATE_METADATA": &metav1.ObjectMeta{
+			Labels: utils.GetModelControllerLabels(model, backend.Name, icUtils.Revision(backend)),
+		},
 		"VOLUMES": []*corev1.Volume{
 			cacheVolume,
+			{
+				Name: dshm,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{
+						Medium: corev1.StorageMediumMemory,
+					},
+				},
+			},
 		},
 		"VOLUME_MOUNTS": []corev1.VolumeMount{{
 			Name:      cacheVolume.Name,
 			MountPath: GetCachePath(backend.CacheURI),
+		}, {
+			Name:      dshm,
+			MountPath: "/dev/shm",
 		}},
 		"INIT_CONTAINERS":                    initContainers,
 		"MODEL_DOWNLOAD_ENVFROM":             backend.EnvFrom,
@@ -303,6 +324,10 @@ func buildVllmModelServing(model *workload.ModelBooster, idx int) (*workload.Mod
 		"ENGINE_SERVER_IMAGE":                workersMap[workload.ModelWorkerTypeServer].Image,
 		"ENGINE_SERVER_COMMAND":              commands,
 		"WORKER_REPLICAS":                    workersMap[workload.ModelWorkerTypeServer].Pods - 1,
+		"SCHEDULER_NAME":                     backend.SchedulerName,
+		"RUNTIME_CLASS_NAME":                 backend.RuntimeClassName,
+		"SERVER_AFFINITY":                    workersMap[workload.ModelWorkerTypeServer].Affinity,
+		"SERVER_TOLERATIONS":                 workersMap[workload.ModelWorkerTypeServer].Tolerations,
 	}
 	return loadModelServingTemplate(VllmTemplatePath, &data)
 }
@@ -317,17 +342,68 @@ func mapWorkers(workers []workload.ModelWorker) map[workload.ModelWorkerType]*wo
 }
 
 // buildCommands constructs the command list for the backend.
-func buildCommands(workerConfig *apiextensionsv1.JSON, modelDownloadPath string,
+func buildCommands(backend *workload.ModelBackend, workerConfig *apiextensionsv1.JSON, modelDownloadPath string,
 	workersMap map[workload.ModelWorkerType]*workload.ModelWorker) ([]string, error) {
-	commands := []string{"python", "-m", "vllm.entrypoints.openai.api_server", "--model", modelDownloadPath}
+	commands := []string{"python3", "-m", "vllm.entrypoints.openai.api_server", "--model", modelDownloadPath}
 	args, err := utils.ConvertVLLMArgsFromJson(workerConfig)
 	commands = append(commands, args...)
 	if workersMap[workload.ModelWorkerTypeServer] != nil && workersMap[workload.ModelWorkerTypeServer].Pods > 1 {
 		commands = append(commands, "--distributed_executor_backend", "ray")
 		commands = []string{"bash", "-c", fmt.Sprintf("chmod u+x %s && %s leader --ray_cluster_size=%d --num-gpus=%d && %s", VllmMultiNodeServingScriptPath, VllmMultiNodeServingScriptPath, workersMap[workload.ModelWorkerTypeServer].Pods, utils.GetDeviceNum(workersMap[workload.ModelWorkerTypeServer]), strings.Join(commands, " "))}
 	}
-	commands = append(commands, "--kv-events-config", config.GetDefaultKVEventsConfig())
+
+	// vllm image does not have mooncake-transfer-engine or nixl installed by default
+	// so we need to install them if GPU is requested
+	kvConnector := getKvConnectorFromConfig(workerConfig)
+	if hasGPU(workersMap) && !env.GetEnvValueOrDefault[bool](backend, env.SkipEngineDependencyInstall, false) {
+		if kvConnector == "MooncakeConnector" {
+			commands = []string{"bash", "-c", "pip install mooncake-transfer-engine && " + strings.Join(commands, " ")}
+		} else if kvConnector == "NixlConnector" {
+			commands = []string{"bash", "-c", "PIP_DISABLE_PIP_VERSION_CHECK=1 pip install -U --no-cache-dir nixl && " + strings.Join(commands, " ")}
+		}
+	}
+
 	return commands, err
+}
+
+// hasGPU returns true if any worker in the map requests GPU resources (nvidia.com/gpu).
+func hasGPU(workersMap map[workload.ModelWorkerType]*workload.ModelWorker) bool {
+	for _, w := range workersMap {
+		if w == nil {
+			continue
+		}
+		if w.Resources.Limits != nil {
+			if val, ok := w.Resources.Limits["nvidia.com/gpu"]; ok {
+				if val.Value() > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// getKvConnectorFromConfig extracts the kv_connector value from worker config.
+func getKvConnectorFromConfig(config *apiextensionsv1.JSON) string {
+	if config == nil || config.Raw == nil {
+		return ""
+	}
+	kvTransferConfig, err := utils.TryGetField(config.Raw, "kv-transfer-config")
+	if err != nil || kvTransferConfig == nil {
+		return ""
+	}
+	kvTransferConfigStr, ok := kvTransferConfig.(string)
+	if !ok {
+		return ""
+	}
+	kvTransferType, err := utils.TryGetField([]byte(kvTransferConfigStr), "kv_connector")
+	if err != nil || kvTransferType == nil {
+		return ""
+	}
+	if converted, ok := kvTransferType.(string); ok {
+		return converted
+	}
+	return ""
 }
 
 // GetMountPath returns the mount path for the given ModelBackend in the format "/<backend.Name>".
@@ -354,7 +430,7 @@ func buildCacheVolume(backend *workload.ModelBackend) (*corev1.Volume, error) {
 			Name: volumeName,
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: GetCachePath(backend.CacheURI),
+					ClaimName: GetPVCClaimName(backend.CacheURI),
 				},
 			},
 		}, nil
@@ -372,11 +448,28 @@ func buildCacheVolume(backend *workload.ModelBackend) (*corev1.Volume, error) {
 	return nil, fmt.Errorf("not support prefix in CacheURI: %s", backend.CacheURI)
 }
 
+// GetCachePath returns the in-container mount path derived from a cache URI.
+// It takes the substring after "://", trims surrounding slashes, and prepends a
+// single "/" so the result is a valid absolute path suitable for a container's
+// VolumeMount.MountPath or HostPath.Path. For example, for "pvc://my-pvc" it
+// returns "/my-pvc". It is NOT a PVC ClaimName; use GetPVCClaimName for that.
 func GetCachePath(path string) string {
 	if path == "" || !strings.Contains(path, URIPrefixSeparator) {
 		return ""
 	}
-	return strings.Split(path, URIPrefixSeparator)[1]
+	s := strings.Split(path, URIPrefixSeparator)[1]
+	s = strings.Trim(s, "/")
+	builder := strings.Builder{}
+	builder.WriteString("/")
+	builder.WriteString(s)
+	return builder.String()
+}
+
+// GetPVCClaimName extracts the bare PVC name from a "pvc://" cache URI, trimming
+// surrounding slashes so malformed inputs like "pvc:///my-pvc" still yield a
+// valid Kubernetes resource name (which cannot contain slashes).
+func GetPVCClaimName(uri string) string {
+	return strings.Trim(strings.TrimPrefix(uri, CacheURIPrefixPVC), "/")
 }
 
 func getVolumeName(backendName string) string {
@@ -391,10 +484,10 @@ func loadModelServingTemplate(templatePath string, data *map[string]interface{})
 	}
 
 	var jsonObj interface{}
-	if err := yaml.Unmarshal(templateBytes, &jsonObj); err != nil {
+	if err = yaml.Unmarshal(templateBytes, &jsonObj); err != nil {
 		return nil, fmt.Errorf("YAML template parse failed: %w", err)
 	}
-	if err := utils.ReplacePlaceholders(&jsonObj, data); err != nil {
+	if err = utils.ReplacePlaceholders(&jsonObj, data); err != nil {
 		return nil, fmt.Errorf("replace placeholders failed: %v", err)
 	}
 
@@ -411,24 +504,6 @@ func loadModelServingTemplate(templatePath string, data *map[string]interface{})
 	}
 
 	return modelServing, nil
-}
-
-// buildDownloaderContainer builds downloader container to reduce code duplication
-func buildDownloaderContainer(name, image, source, outputDir string, backend *workload.ModelBackend, cacheVolumeName string) corev1.Container {
-	return corev1.Container{
-		Name:  name,
-		Image: image,
-		Args: []string{
-			"--source", source,
-			"--output-dir", outputDir,
-		},
-		Env:     backend.Env,
-		EnvFrom: backend.EnvFrom,
-		VolumeMounts: []corev1.VolumeMount{{
-			Name:      cacheVolumeName,
-			MountPath: GetCachePath(backend.CacheURI),
-		}},
-	}
 }
 
 func buildEngineEnvVars(backend *workload.ModelBackend, additionalEnvs ...corev1.EnvVar) []corev1.EnvVar {
@@ -478,36 +553,4 @@ func buildEngineEnvVars(backend *workload.ModelBackend, additionalEnvs ...corev1
 		},
 	}
 	return append(append(append([]corev1.EnvVar(nil), backend.Env...), standardEnvs...), additionalEnvs...)
-}
-
-// buildLoraComponents builds LoRA related commands and containers
-func buildLoraComponents(model *workload.ModelBooster, backend *workload.ModelBackend, cacheVolumeName string) ([]string, []corev1.Container) {
-	adapterCount := len(backend.LoraAdapters)
-	loras := make([]string, 0, adapterCount)
-	loraContainers := make([]corev1.Container, 0, adapterCount)
-
-	for i, adapter := range backend.LoraAdapters {
-		// Create LoRA downloader container
-		containerName := fmt.Sprintf("%s-lora-downloader-%d", model.Name, i)
-		outputDir := GetCachePath(backend.CacheURI) + GetMountPath(adapter.ArtifactURL)
-
-		// Build LoRA module string
-		loraModule := fmt.Sprintf("%s=%s", adapter.Name, outputDir)
-		loras = append(loras, loraModule)
-
-		loraContainer := buildDownloaderContainer(
-			containerName,
-			config.Config.DownloaderImage(),
-			adapter.ArtifactURL,
-			outputDir,
-			backend,
-			cacheVolumeName,
-		)
-		loraContainers = append(loraContainers, loraContainer)
-	}
-
-	// Build LoRA command arguments
-	loraCommands := append([]string{"--enable-lora", "--lora-modules"}, loras...)
-
-	return loraCommands, loraContainers
 }

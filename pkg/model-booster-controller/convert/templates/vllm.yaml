@@ -2,6 +2,7 @@ apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: ModelServing
 metadata: ${MODEL_SERVING_TEMPLATE_METADATA}
 spec:
+  schedulerName: ${SCHEDULER_NAME}
   topologySpreadConstraints:
     - maxSkew: 1
       topologyKey: kubernetes.io/hostname
@@ -12,12 +13,18 @@ spec:
   replicas: ${BACKEND_REPLICAS}
   template:
     restartGracePeriodSeconds: 60
+    gangPolicy:
+      minRoleReplicas:
+        leader: ${SERVER_REPLICAS}
     roles:
       - name: leader
         replicas: ${SERVER_REPLICAS}
         entryTemplate:
           metadata: ${SERVER_ENTRY_TEMPLATE_METADATA}
           spec:
+            runtimeClassName: ${RUNTIME_CLASS_NAME}
+            affinity: ${SERVER_AFFINITY}
+            tolerations: ${SERVER_TOLERATIONS}
             initContainers: ${INIT_CONTAINERS}
             terminationGracePeriodSeconds: 300
             volumes: ${VOLUMES}
@@ -59,7 +66,7 @@ spec:
                     path: /health
                     port: 8000
                     scheme: HTTP
-                  initialDelaySeconds: 90
+                  initialDelaySeconds: 180
                   periodSeconds: 5
                   successThreshold: 1
                   timeoutSeconds: 1
@@ -85,6 +92,9 @@ spec:
         workerTemplate:
           metadata: ${SERVER_WORKER_TEMPLATE_METADATA}
           spec:
+            runtimeClassName: ${RUNTIME_CLASS_NAME}
+            affinity: ${SERVER_AFFINITY}
+            tolerations: ${SERVER_TOLERATIONS}
             volumes: ${VOLUMES}
             initContainers: ${INIT_CONTAINERS}
             containers:
@@ -93,7 +103,7 @@ spec:
                 command:
                   - bash
                   - "-c"
-                  - "chmod u+x /vllm-workspace/vllm/examples/online_serving/multi-node-serving.sh && /vllm-workspace/vllm/examples/online_serving/multi-node-serving.sh worker --ray_address=$(ENTRY_ADDRESS)"
+                  - "chmod u+x examples/online_serving/multi-node-serving.sh && examples/online_serving/multi-node-serving.sh worker --ray_address=$(ENTRY_ADDRESS)"
                 env: ${WORKER_ENV}
                 resources: ${ENGINE_SERVER_RESOURCES}
                 volumeMounts: ${VOLUME_MOUNTS}

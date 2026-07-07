@@ -35,16 +35,16 @@ To add your new documentation to the sidebar navigation, edit `sidebars.ts`:
 
 ```typescript
 const sidebars: SidebarsConfig = {
-  tutorialSidebar: [
-    'intro',
-    {
-      type: 'category',
-      label: 'Your Category',
-      items: [
-        'your-category/your-new-page',
-      ],
-    },
-  ],
+    tutorialSidebar: [
+        'intro',
+        {
+            type: 'category',
+            label: 'Your Category',
+            items: [
+                'your-category/your-new-page',
+            ],
+        },
+    ],
 };
 ```
 
@@ -57,8 +57,8 @@ const sidebars: SidebarsConfig = {
 5. Build the site to ensure no errors: `npm run build`
 6. Submit a pull request with a clear description of your changes
 
-
 ---
+
 ## Documentation Generation with crd-ref-docs
 
 This document explains how to use `crd-ref-docs` to generate API reference documentation for the Kthena project's Custom Resource Definitions (CRDs).
@@ -87,6 +87,7 @@ make gen-docs
 ```
 
 This command will:
+
 1. Download and install the `crd-ref-docs` tool (if not already present)
 2. Scan the `pkg/apis` directory for CRD definitions
 3. Generate markdown documentation in `docs/kthena/docs/api/`
@@ -98,7 +99,7 @@ The documentation generation is configured via `docs/kthena/crd-ref-docs-config.
 ```yaml
 # Minimal configuration for crd-ref-docs
 processor:
-  ignoreFields: []
+  ignoreFields: [ ]
 render:
   kubernetesVersion: "1.33"
 ```
@@ -112,11 +113,10 @@ For advanced configuration options, refer to the [crd-ref-docs documentation](ht
 
 #### API Groups
 
-The Kthena project defines CRDs in three main API groups:
+The Kthena project defines CRDs in two main API groups:
 
-- **registry.volcano.sh**: Model registry and autoscaling policies
-- **networking.volcano.sh**: Network routing and traffic management
-- **workload.volcano.sh**: Workload management and scheduling
+- **networking.serving.volcano.sh**: Network routing and traffic management
+- **workload.serving.volcano.sh**: Workload management and scheduling
 
 ### Customizing Documentation
 
@@ -125,14 +125,16 @@ The Kthena project defines CRDs in three main API groups:
 To improve the generated documentation, add Go comments to your struct fields:
 
 ```go
+package v1alpha1
+
 type ModelSpec struct {
-    // Name is the human-readable name of the model
-    // +kubebuilder:validation:Required
-    Name string `json:"name"`
-    
-    // Version specifies the model version to deploy
-    // +kubebuilder:validation:Pattern=^v\d+\.\d+\.\d+$
-    Version string `json:"version"`
+	// Name is the human-readable name of the model
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// Version specifies the model version to deploy
+	// +kubebuilder:validation:Pattern=^v\d+\.\d+\.\d+$
+	Version string `json:"version"`
 }
 ```
 
@@ -167,15 +169,9 @@ make gen-docs VERBOSE=1
 
 ### Integration with CI/CD
 
-To ensure documentation stays up-to-date, add the documentation generation to your CI pipeline:
+To ensure documentation stays up-to-date, add documentation generation check to your CI pipeline:
 
-```yaml
-- name: Generate API Documentation
-  run: make gen-docs
-  
-- name: Check for documentation changes
-  run: git diff --exit-code docs/kthena/docs/api/
-```
+See details in [go-check](../../.github/workflows/go-check.yml)
 
 ### Manual Tool Installation
 
@@ -190,6 +186,30 @@ make crd-ref-docs
 ```
 
 ---
+
+## Documentation Generation with Helm-Docs
+
+We use [helm-docs](https://github.com/norwoodj/helm-docs) to automatically generate Helm chart documentation from our
+`charts/kthena/values.yaml` file.
+
+### Generation Scope
+
+generating doc only for `charts/kthena/values.yaml` is the recommended best practice.
+
+- Unified Interface: Users typically deploy the parent chart (kthena) and configure it via its main values.yaml. Documenting this single entry point provides a clear, consolidated reference.
+- Reduced Confusion: Generating separate docs for subcharts (networking, workload) can confuse users about which files they should be editing. The parent chart's values.yaml acts as the public API for the entire system.
+
+We use 'charts/kthena/.helmdocsignore' to control the documentation generation scope.
+
+### Key Benefits
+
+1. **Consistent Formatting**: Generates clean, well-structured documentation tables
+2. **Automated Synchronization**: When integrated into CI/CD pipelines, ensures documentation always reflects the latest
+   `values.yaml` configuration
+3. **Time Efficiency**: Eliminates manual documentation updates, reducing errors and saving development time
+
+---
+
 ## Deployment
 
 Using SSH:
@@ -205,3 +225,19 @@ GIT_USER=<Your GitHub username> npm run deploy
 ```
 
 If you are using GitHub pages for hosting, this command is a convenient way to build the website and push to the `gh-pages` branch.
+
+## Manage Docs Versions
+
+Release a version 1.0 of your project:
+
+```shell
+npm run docusaurus docs:version v0.2.0
+```
+
+Please refer to [this guide](https://tutorial.docusaurus.io/docs/tutorial-extras/manage-docs-versions/) for more information.
+
+## Using Algolia DocSearch
+
+Docusaurus has official support for [Algolia DocSearch](https://docsearch.algolia.com/).
+
+Please refer to the [Docusaurus Search Documentation](https://docusaurus.io/docs/search#using-algolia-docsearch)  for more details.

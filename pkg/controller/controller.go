@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -26,6 +28,7 @@ import (
 	modelbooster "github.com/volcano-sh/kthena/pkg/model-booster-controller/controller"
 	"github.com/volcano-sh/kthena/pkg/model-booster-controller/utils"
 	modelserving "github.com/volcano-sh/kthena/pkg/model-serving-controller/controller"
+	apiextclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/kubernetes"
@@ -42,6 +45,10 @@ const (
 	defaultRetryPeriod   = 2 * time.Second
 	leaderElectionId     = "kthena.controller-manager"
 	leaseName            = "lease.kthena.controller-manager"
+
+	ModelServingController = "modelserving"
+	ModelBoosterController = "modelbooster"
+	AutoscalerController   = "autoscaler"
 )
 
 func SetupController(ctx context.Context, cc Config) {
@@ -49,27 +56,107 @@ func SetupController(ctx context.Context, cc Config) {
 	if err != nil {
 		klog.Fatalf("build client config: %v", err)
 	}
+	// Set QPS and Burst if provided
+	if cc.KubeAPIQPS > 0 {
+		config.QPS = cc.KubeAPIQPS
+	}
+	if cc.KubeAPIBurst > 0 {
+		config.Burst = cc.KubeAPIBurst
+	}
 	kubeClient := kubernetes.NewForConfigOrDie(config)
 	client := clientset.NewForConfigOrDie(config)
 	volcanoClient, err := volcanoClientSet.NewForConfig(config)
 	if err != nil {
 		klog.Fatalf("failed to create volcano client: %v", err)
 	}
-	mc := modelbooster.NewModelBoosterController(kubeClient, client)
-	msc, err := modelserving.NewModelServingController(kubeClient, client, volcanoClient)
+	apiextClient, err := apiextclient.NewForConfig(config)
 	if err != nil {
-		klog.Fatalf("failed to create ModelServing controller: %v", err)
+		klog.Fatalf("failed to create apiext client: %v", err)
 	}
-	namespace, err := utils.GetInClusterNameSpace()
-	if err != nil {
-		klog.Fatalf("create Autoscaler client: %v", err)
+
+	var mc *modelbooster.ModelBoosterController
+	var msc *modelserving.ModelServingController
+	var lwsc *modelserving.LWSController
+	var ac *autoscaler.AutoscaleController
+
+	for ctrl, enable := range cc.Controllers {
+		if enable {
+			switch ctrl {
+			case ModelBoosterController:
+				mc = modelbooster.NewModelBoosterController(kubeClient, client)
+			case ModelServingController:
+				msc, err = modelserving.NewModelServingController(kubeClient, client, volcanoClient, apiextClient)
+				if err != nil {
+					klog.Fatalf("failed to create ModelServing controller: %v", err)
+				}
+				lwsc, err = modelserving.InitializeLWSController(config, kubeClient, client)
+				if err != nil {
+					klog.Errorf("Failed to initialize LWS controller: %v", err)
+				} else if lwsc == nil {
+					klog.Info("LeaderWorkerSet CRD not found, LWS support disabled")
+				}
+			case AutoscalerController:
+				ac = autoscaler.NewAutoscaleController(kubeClient, client)
+			}
+		}
 	}
-	ac := autoscaler.NewAutoscaleController(kubeClient, client, namespace)
+
+	startControllers := func(ctx context.Context) {
+		if mc != nil {
+			go mc.Run(ctx, cc.Workers)
+			klog.Info("ModelBooster controller started")
+		}
+		if msc != nil {
+			go msc.Run(ctx, cc.Workers)
+			klog.Info("ModelServing controller started")
+
+			if lwsc != nil {
+				go func() {
+					if err = lwsc.Run(ctx, 1); err != nil {
+						klog.Errorf("Error running LWS controller: %s", err.Error())
+					}
+				}()
+				klog.Info("ModelServing lws controller started")
+			}
+		}
+		if ac != nil {
+			go ac.Run(ctx)
+			klog.Info("Autoscaler controller started")
+		}
+
+		if cc.DebugPort > 0 {
+			go func() {
+				debugMux := http.ServeMux{}
+				if msc != nil {
+					msc.RegisterModelServingDebugEndpoints(&debugMux)
+				}
+				// Ensure the debug server is only accessible locally for security reasons
+				debugAddr := fmt.Sprintf("localhost:%d", cc.DebugPort)
+				klog.Infof("Starting debug server on %s", debugAddr)
+				server := &http.Server{
+					Addr:              debugAddr,
+					Handler:           &debugMux,
+					ReadHeaderTimeout: 5 * time.Second,
+					ReadTimeout:       10 * time.Second,
+					WriteTimeout:      10 * time.Second,
+					IdleTimeout:       30 * time.Second,
+				}
+				go func() {
+					<-ctx.Done()
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					_ = server.Shutdown(shutdownCtx)
+				}()
+				if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					klog.Errorf("Debug server failed: %v", err)
+				}
+			}()
+		}
+	}
+
 	if cc.EnableLeaderElection {
 		startedLeading := func(ctx context.Context) {
-			go mc.Run(ctx, cc.Workers)
-			go msc.Run(ctx, cc.Workers)
-			go ac.Run(ctx)
+			startControllers(ctx)
 			klog.Info("Start as leader")
 		}
 		leaderElector, err := initLeaderElector(kubeClient, startedLeading)
@@ -78,10 +165,8 @@ func SetupController(ctx context.Context, cc Config) {
 		}
 		leaderElector.Run(ctx)
 	} else {
-		go mc.Run(ctx, cc.Workers)
-		go msc.Run(ctx, cc.Workers)
-		go ac.Run(ctx)
-		klog.Info("Started controller without leader election")
+		startControllers(ctx)
+		klog.Info("Started controllers without leader election")
 	}
 	<-ctx.Done()
 }

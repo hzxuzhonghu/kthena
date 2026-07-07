@@ -17,25 +17,12 @@ limitations under the License.
 package v1alpha1
 
 import (
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 const (
-	// ModelServingNameLabelKey is the pod label key for the model serving name.
-	ModelServingNameLabelKey = "modelserving.volcano.sh/name"
-	// GroupNameLabelKey is the pod label key for the group name.
-	GroupNameLabelKey = "modelserving.volcano.sh/group-name"
-	// RoleLabelKey is the pod label key for the role.
-	RoleLabelKey = "modelserving.volcano.sh/role"
-	// RoleIDKey is the pod label key for the role serial number.
-	RoleIDKey = "modelserving.volcano.sh/role-id"
-	// EntryLabelKey is the entry pod label key.
-	EntryLabelKey = "modelserving.volcano.sh/entry"
-
-	// RevisionLabelKey is the revision label for the model serving.
-	RevisionLabelKey = "modelserving.volcano.sh/revision"
-
 	// Environment injected to the worker pods.
 	EntryAddressEnv = "ENTRY_ADDRESS"
 	// WorkerIndexEnv is the environment variable for the worker index.
@@ -55,7 +42,14 @@ type ModelServingSpec struct {
 	Replicas *int32 `json:"replicas,omitempty"`
 
 	// SchedulerName defines the name of the scheduler used by ModelServing
+	//
+	// +optional
+	// +kubebuilder:default=volcano
 	SchedulerName string `json:"schedulerName"`
+
+	// Plugins defines optional plugin chain to customize serving pods.
+	// +optional
+	Plugins []PluginSpec `json:"plugins,omitempty"`
 
 	// Template defines the template for ServingGroup
 	Template ServingGroup `json:"template"`
@@ -68,11 +62,57 @@ type ModelServingSpec struct {
 	// +kubebuilder:default=RoleRecreate
 	// +kubebuilder:validation:Enum={ServingGroupRecreate,RoleRecreate,None}
 	// +optional
-	RecoveryPolicy            RecoveryPolicy             `json:"recoveryPolicy,omitempty"`
-	TopologySpreadConstraints []TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+	RecoveryPolicy RecoveryPolicy `json:"recoveryPolicy,omitempty"`
 }
 
 type RecoveryPolicy string
+
+// PluginType represents the implementation category of a plugin.
+type PluginType string
+
+const (
+	PluginTypeBuiltIn PluginType = "BuiltIn"
+)
+
+// PluginTarget specifies which pod kinds a plugin applies to.
+// If empty, it defaults to All.
+type PluginTarget string
+
+const (
+	PluginTargetAll    PluginTarget = "All"
+	PluginTargetEntry  PluginTarget = "Entry"
+	PluginTargetWorker PluginTarget = "Worker"
+)
+
+// PluginScope restricts where a plugin is applied.
+// Roles is a whitelist; empty means all roles.
+// Target limits to entry/worker/all pods; empty means all pods.
+type PluginScope struct {
+	// Roles limits the plugin to the specified role names.
+	// +optional
+	Roles []string `json:"roles,omitempty"`
+	// Target limits the plugin to specific pod target (Entry/Worker/All).
+	// kubebuilder:default=All
+	// kubebuilder:validation:Enum={All,Entry,Worker}
+	Target PluginTarget `json:"target,omitempty"`
+}
+
+// PluginSpec declares a plugin instance attached to a ModelServing.
+type PluginSpec struct {
+	// Name uniquely identifies the plugin instance within the ModelServing.
+	Name string `json:"name"`
+	// Type indicates plugin category. For now, only BuiltIn is supported.
+	// +kubebuilder:default=BuiltIn
+	// +kubebuilder:validation:Enum={BuiltIn}
+	Type PluginType `json:"type"`
+	// Config is an opaque JSON blob interpreted by the plugin implementation.
+	// +optional
+	Config *apiextensionsv1.JSON `json:"config,omitempty"`
+	// Scope optionally narrows where this plugin runs.
+	// By default, it runs on all pods.
+	// +optional
+	Scope *PluginScope `json:"scope,omitempty"`
+}
 
 const (
 	// ServingGroupRecreate will recreate all the pods in the ServingGroup if
@@ -93,67 +133,53 @@ const (
 // RolloutStrategy defines the strategy that the ModelServing controller
 // will use to perform replica updates.
 type RolloutStrategy struct {
-	// Type defines the rollout strategy, it can only be “ServingGroupRollingUpdate” for now.
+	// Type defines the rollout strategy. Supported values are
+	// "ServingGroupRollingUpdate" and "RoleRollingUpdate". If not specified,
+	// it defaults to "ServingGroupRollingUpdate".
+	// For `RoleRollingUpdate`, the `maxUnavailable` field in each Role will be used to determine the maximum number of role instances that can be unavailable during the update.
 	//
-	// +kubebuilder:validation:Enum={ServingGroupRollingUpdate}
 	// +kubebuilder:default=ServingGroupRollingUpdate
+	// +kubebuilder:validation:Enum={ServingGroupRollingUpdate,RoleRollingUpdate}
 	Type RolloutStrategyType `json:"type"`
 
-	// RollingUpdateConfiguration defines the parameters to be used when type is RollingUpdateStrategyType.
+	// RollingUpdateConfiguration defines the parameters to be used when type is ServingGroupRollingUpdate.
 	// optional
 	RollingUpdateConfiguration *RollingUpdateConfiguration `json:"rollingUpdateConfiguration,omitempty"`
 }
 
+// RolloutStrategyType defines the strategy to use to update replicas.
+// Note that if `recoveryPolicy` is set to `ServingGroupRecreate` and `rolloutStrategyType` is set to `RoleRollingUpdate`,
+// the entire servingGroup will be deleted during a rolling update because the outdated role is removed.
 type RolloutStrategyType string
 
 const (
-	// ServingGroupRollingUpdate indicates that ServingGroup replicas will be updated one by one.
+	// `ServingGroupRollingUpdate` indicates that ServingGroup replicas will be updated one by one.
 	ServingGroupRollingUpdate RolloutStrategyType = "ServingGroupRollingUpdate"
+
+	// `RoleRollingUpdate` indicates that Role replicas will be updated one by one.
+	RoleRollingUpdate RolloutStrategyType = "RoleRollingUpdate"
 )
 
-// RollingUpdateConfiguration defines the parameters to be used for RollingUpdateStrategyType.
+// RollingUpdateConfiguration defines the parameters to be used for ServingGroupRollingUpdate.
 type RollingUpdateConfiguration struct {
 	// The maximum number of replicas that can be unavailable during the update.
 	// Value can be an absolute number (ex: 5) or a percentage of total replicas at the start of update (ex: 10%).
 	// Absolute number is calculated from percentage by rounding down.
-	// This can not be 0 if MaxSurge is 0.
+	// This can not be 0.
 	// By default, a fixed value of 1 is used.
 	// +kubebuilder:validation:XIntOrString
 	// +kubebuilder:default=1
-	MaxUnavailable intstr.IntOrString `json:"maxUnavailable,omitempty"`
+	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
 
-	// The maximum number of replicas that can be scheduled above the original number of
-	// replicas.
-	// Value can be an absolute number (ex: 5) or a percentage of total replicas at
-	// the start of the update (ex: 10%).
-	// Absolute number is calculated from percentage by rounding up.
-	// By default, a value of 0 is used.
-	// +kubebuilder:validation:XIntOrString
-	// +kubebuilder:default=0
-	MaxSurge intstr.IntOrString `json:"maxSurge,omitempty"`
 	// Partition indicates the ordinal at which the ModelServing should be partitioned
 	// for updates. During a rolling update, all ServingGroups from ordinal Replicas-1 to
 	// Partition are updated. All ServingGroups from ordinal Partition-1 to 0 remain untouched.
+	// Value can be an absolute number (ex: 5) or a percentage of total replicas (ex: 10%).
+	// Absolute number is calculated from percentage by rounding up.
 	// The default value is 0.
+	// +kubebuilder:validation:XIntOrString
 	// +optional
-	Partition *int32 `json:"partition,omitempty"`
-}
-
-// TopologySpreadConstraint defines the topology spread constraint.
-type TopologySpreadConstraint struct {
-	// MaxSkew describes the degree to which ServingGroup may be unevenly distributed.
-	MaxSkew int32 `json:"maxSkew,omitempty"`
-
-	// TopologyKey is the key of node labels. Nodes that have a label with this key
-	// and identical values are considered to be in the same topology.
-	TopologyKey string `json:"topologyKey,omitempty"`
-
-	// WhenUnsatisfiable indicates how to deal with an ServingGroup if it doesn't satisfy
-	// the spread constraint.
-	WhenUnsatisfiable string `json:"whenUnsatisfiable,omitempty"`
-
-	// LabelSelector is used to find matching ServingGroups.
-	LabelSelector *metav1.LabelSelector `json:"labelSelector,omitempty"`
+	Partition *intstr.IntOrString `json:"partition,omitempty"`
 }
 
 type ModelServingConditionType string
@@ -195,12 +221,26 @@ type ModelServingStatus struct {
 	// AvailableReplicas track the number of ServingGroup that are in ready state (updated or not).
 	AvailableReplicas int32 `json:"availableReplicas,omitempty"`
 
+	// CurrentRevision, if not empty, indicates the ControllerRevision version used to generate
+	// ServingGroups in the sequence [0,currentReplicas).
+	// +optional
+	CurrentRevision string `json:"currentRevision,omitempty"`
+
+	// UpdateRevision, if not empty, indicates the ControllerRevision version used to generate
+	// ServingGroups in the sequence [replicas-updatedReplicas,replicas).
+	// +optional
+	UpdateRevision string `json:"updateRevision,omitempty"`
+
 	// Conditions track the condition of the ModelServing.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// LabelSelector is a label query over pods that should match the replica count.
+	LabelSelector string `json:"labelSelector,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.labelSelector
 // +kubebuilder:storageversion
 // +genclient
 

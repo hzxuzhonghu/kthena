@@ -20,24 +20,21 @@ import (
 	"context"
 	"sort"
 
-	clientset "github.com/volcano-sh/kthena/client-go/clientset/versioned"
-	workloadLister "github.com/volcano-sh/kthena/client-go/listers/workload/v1alpha1"
 	workload "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/autoscaler/algorithm"
-	"github.com/volcano-sh/kthena/pkg/autoscaler/util"
 	listerv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/ptr"
 )
 
 type Optimizer struct {
 	Meta       *OptimizerMeta
 	Collectors map[string]*MetricCollector
 	Status     *Status
+	Generations
 }
 
 type OptimizerMeta struct {
-	Config        *workload.OptimizerConfiguration
+	Config        *workload.HeterogeneousTarget
 	MetricTargets map[string]float64
 	ScalingOrder  []*ReplicaBlock
 	MinReplicas   int32
@@ -70,16 +67,16 @@ func (meta *OptimizerMeta) RestoreReplicasOfEachBackend(replicas int32) map[stri
 	return replicasMap
 }
 
-func NewOptimizerMeta(binding *workload.AutoscalingPolicyBinding) *OptimizerMeta {
-	if binding.Spec.OptimizerConfiguration == nil {
-		klog.Warningf("OptimizerConfig not configured in binding: %s", binding.Name)
+func NewOptimizerMeta(policy *workload.AutoscalingPolicy) *OptimizerMeta {
+	if policy.Spec.HeterogeneousTarget == nil {
+		klog.Warningf("OptimizerConfig not configured in policy: %s", policy.Name)
 		return nil
 	}
-	costExpansionRatePercent := binding.Spec.OptimizerConfiguration.CostExpansionRatePercent
+	costExpansionRatePercent := policy.Spec.HeterogeneousTarget.CostExpansionRatePercent
 	minReplicas := int32(0)
 	maxReplicas := int32(0)
 	var scalingOrder []*ReplicaBlock
-	for index, param := range binding.Spec.OptimizerConfiguration.Params {
+	for index, param := range policy.Spec.HeterogeneousTarget.Params {
 		minReplicas += param.MinReplicas
 		maxReplicas += param.MaxReplicas
 		replicas := param.MaxReplicas - param.MinReplicas
@@ -115,37 +112,47 @@ func NewOptimizerMeta(binding *workload.AutoscalingPolicyBinding) *OptimizerMeta
 		return scalingOrder[i].index < scalingOrder[j].index
 	})
 	return &OptimizerMeta{
-		Config:       binding.Spec.OptimizerConfiguration,
+		Config:       policy.Spec.HeterogeneousTarget,
 		MinReplicas:  minReplicas,
 		MaxReplicas:  maxReplicas,
 		ScalingOrder: scalingOrder,
 		Scope: Scope{
-			OwnedBindingId: binding.UID,
-			Namespace:      binding.Namespace,
+			OwnedPolicyId: policy.UID,
+			Namespace:     policy.Namespace,
 		},
 	}
 }
 
-func NewOptimizer(behavior *workload.AutoscalingPolicyBehavior, binding *workload.AutoscalingPolicyBinding, metricTargets map[string]float64) *Optimizer {
+func NewOptimizer(autoscalePolicy *workload.AutoscalingPolicy) *Optimizer {
+	metricTargets := GetMetricTargets(autoscalePolicy)
 	collectors := make(map[string]*MetricCollector)
-	for _, param := range binding.Spec.OptimizerConfiguration.Params {
-		collectors[param.Target.TargetRef.Name] = NewMetricCollector(&param.Target, binding, metricTargets)
+	for _, param := range autoscalePolicy.Spec.HeterogeneousTarget.Params {
+		collectors[param.Target.TargetRef.Name] = NewMetricCollector(&param.Target, autoscalePolicy, metricTargets)
 	}
 
+	meta := NewOptimizerMeta(autoscalePolicy)
+	meta.MetricTargets = metricTargets
 	return &Optimizer{
-		Meta:       NewOptimizerMeta(binding),
+		Meta:       meta,
 		Collectors: collectors,
-		Status:     NewStatus(behavior),
+		Status:     NewStatus(&autoscalePolicy.Spec.Behavior),
+		Generations: Generations{
+			AutoscalePolicyGeneration: autoscalePolicy.Generation,
+		},
 	}
 }
 
-func (optimizer *Optimizer) Optimize(ctx context.Context, client clientset.Interface, modelInferLister workloadLister.ModelServingLister, podLister listerv1.PodLister, autoscalePolicy *workload.AutoscalingPolicy) error {
+func (optimizer *Optimizer) NeedUpdate(policy *workload.AutoscalingPolicy) bool {
+	return optimizer.Generations.AutoscalePolicyGeneration != policy.Generation
+}
+
+func (optimizer *Optimizer) Optimize(ctx context.Context, podLister listerv1.PodLister, autoscalePolicy *workload.AutoscalingPolicy, currentInstancesCounts map[string]int32) (map[string]int32, error) {
 	size := len(optimizer.Meta.Config.Params)
 	unreadyInstancesCount := int32(0)
 	readyInstancesMetrics := make([]algorithm.Metrics, 0, size)
-	currentInstancesCount := int32(0)
-	modelInferList := make([]*workload.ModelServing, 0, size)
-	// Update all model infer instances' metrics
+	externalMetrics := make(algorithm.Metrics)
+	instancesCountSum := int32(0)
+	// Update all model serving instances' metrics
 	for _, param := range optimizer.Meta.Config.Params {
 		collector, exists := optimizer.Collectors[param.Target.TargetRef.Name]
 		if !exists {
@@ -153,41 +160,40 @@ func (optimizer *Optimizer) Optimize(ctx context.Context, client clientset.Inter
 			continue
 		}
 
-		// Get autoscaler target(model infer) instance
-		modelInfer, err := util.GetModelInferTarget(modelInferLister, optimizer.Meta.Scope.Namespace, param.Target.TargetRef.Name)
-		if err != nil {
-			klog.Errorf("get model infer error: %v", err)
-			return err
-		}
-		currentInstancesCount += *modelInfer.Spec.Replicas
-		klog.Infof("ModelBooster infer:%s, current replicas:%d", modelInfer.Name, modelInfer.Spec.Replicas)
-
-		currentUnreadyInstancesCount, currentReadyInstancesMetrics, err := collector.UpdateMetrics(ctx, podLister)
+		instancesCountSum += currentInstancesCounts[param.Target.TargetRef.Name]
+		currentUnreadyInstancesCount, currentReadyInstancesMetrics, currentExternalMetrics, err := collector.UpdateMetrics(ctx, podLister, param.Target.MetricSources)
 		if err != nil {
 			klog.Warningf("update metrics error: %v", err)
 			continue
 		}
 		unreadyInstancesCount += currentUnreadyInstancesCount
 		readyInstancesMetrics = append(readyInstancesMetrics, currentReadyInstancesMetrics)
-		modelInferList = append(modelInferList, modelInfer)
+		// TODO: External metrics are aggregated with a plain sum across targets.
+		// This is correct for additive metrics (for example queue length), but it
+		// is semantically wrong for ratio metrics such as GPU utilization.
+		// Introduce per-metric aggregation strategy (sum/avg/max/weighted) in a
+		// follow-up change and apply it here instead of unconditional summation.
+		for metricName, metricValue := range currentExternalMetrics {
+			addMetric(externalMetrics, metricName, metricValue)
+		}
 	}
-	// Get recommended replicas of all model infer instances
+	// Get recommended replicas of all model serving instances
 	instancesAlgorithm := algorithm.RecommendedInstancesAlgorithm{
 		MinInstances:          optimizer.Meta.MinReplicas,
 		MaxInstances:          optimizer.Meta.MaxReplicas,
-		CurrentInstancesCount: currentInstancesCount,
+		CurrentInstancesCount: instancesCountSum,
 		Tolerance:             float64(autoscalePolicy.Spec.TolerancePercent) * 0.01,
 		MetricTargets:         optimizer.Meta.MetricTargets,
 		UnreadyInstancesCount: unreadyInstancesCount,
 		ReadyInstancesMetrics: readyInstancesMetrics,
-		ExternalMetrics:       make(algorithm.Metrics),
+		ExternalMetrics:       externalMetrics,
 	}
 	recommendedInstances, skip := instancesAlgorithm.GetRecommendedInstances()
 	if skip {
 		klog.Warning("skip recommended instances")
-		return nil
+		return nil, nil
 	}
-	if recommendedInstances*100 >= currentInstancesCount*(*autoscalePolicy.Spec.Behavior.ScaleUp.PanicPolicy.PanicThresholdPercent) {
+	if recommendedInstances*100 >= instancesCountSum*(*autoscalePolicy.Spec.Behavior.ScaleUp.PanicPolicy.PanicThresholdPercent) {
 		optimizer.Status.RefreshPanicMode()
 	}
 	CorrectedInstancesAlgorithm := algorithm.CorrectedInstancesAlgorithm{
@@ -196,7 +202,7 @@ func (optimizer *Optimizer) Optimize(ctx context.Context, client clientset.Inter
 		Behavior:             &autoscalePolicy.Spec.Behavior,
 		MinInstances:         optimizer.Meta.MinReplicas,
 		MaxInstances:         optimizer.Meta.MaxReplicas,
-		CurrentInstances:     currentInstancesCount,
+		CurrentInstances:     instancesCountSum,
 		RecommendedInstances: recommendedInstances}
 	recommendedInstances = CorrectedInstancesAlgorithm.GetCorrectedInstances()
 
@@ -205,20 +211,5 @@ func (optimizer *Optimizer) Optimize(ctx context.Context, client clientset.Inter
 	optimizer.Status.AppendCorrected(recommendedInstances)
 
 	replicasMap := optimizer.Meta.RestoreReplicasOfEachBackend(recommendedInstances)
-
-	// Update model infer replicas
-	for _, modelInfer := range modelInferList {
-		if replicasMap[modelInfer.Name] == *modelInfer.Spec.Replicas {
-			klog.Warning("modelInfer replicas no need to update")
-			continue
-		}
-		modelInferCopy := modelInfer.DeepCopy()
-		modelInferCopy.Spec.Replicas = ptr.To(replicasMap[modelInfer.Name])
-		err := util.UpdateModelInfer(ctx, client, modelInferCopy)
-		if err != nil {
-			klog.Errorf("failed to update modelInfer replicas for modelInfer.Name: %s, error: %v", modelInfer.Name, err)
-			return err
-		}
-	}
-	return nil
+	return replicasMap, nil
 }

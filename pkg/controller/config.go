@@ -21,4 +21,8 @@ type Config struct {
 	Workers              int
 	Kubeconfig           string
 	MasterURL            string
+	Controllers          map[string]bool
+	KubeAPIQPS           float32
+	KubeAPIBurst         int
+	DebugPort            int
 }

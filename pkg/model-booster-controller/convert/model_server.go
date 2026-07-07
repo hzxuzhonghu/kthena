@@ -29,67 +29,65 @@ import (
 )
 
 var VLLMKvConnectorType = map[string]networking.KVConnectorType{
-	"MooncakeConnectorV1": networking.ConnectorTypeMoonCake,
-	"LMCacheConnectorV1":  networking.ConnectorTypeLMCache,
+	"MooncakeConnector":  networking.ConnectorTypeMoonCake,
+	"NixlConnector":      networking.ConnectorTypeNIXL,
+	"LMCacheConnectorV1": networking.ConnectorTypeLMCache,
 }
 
 // BuildModelServer creates arrays of ModelServer for the given model.
 // Each model backend will create one model server.
 func BuildModelServer(model *workload.ModelBooster) ([]*networking.ModelServer, error) {
 	var modelServers []*networking.ModelServer
-	for _, backend := range model.Spec.Backends {
-		var inferenceEngine networking.InferenceEngine
-		switch backend.Type {
-		case workload.ModelBackendTypeVLLM, workload.ModelBackendTypeVLLMDisaggregated:
-			inferenceEngine = networking.VLLM
-		default:
-			return nil, fmt.Errorf("not support %s backend yet, please use vLLM backend", backend.Type)
-		}
-		servedModelName, err := getServedModelName(model, backend)
-		if err != nil {
-			return nil, err
-		}
-		pdGroup := getPdGroup(backend)
-		kvConnector, err := getKvConnectorSpec(backend)
-		if err != nil {
-			return nil, err
-		}
-		modelServer := networking.ModelServer{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       networking.ModelServerKind,
-				APIVersion: networking.GroupVersion.String(),
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      utils.GetBackendResourceName(model.Name, backend.Name),
-				Namespace: model.Namespace,
-				OwnerReferences: []metav1.OwnerReference{
-					utils.NewModelOwnerRef(model),
-				},
-			},
-			Spec: networking.ModelServerSpec{
-				Model:           &servedModelName,
-				InferenceEngine: inferenceEngine,
-				WorkloadSelector: &networking.WorkloadSelector{
-					MatchLabels: map[string]string{
-						utils.OwnerUIDKey: string(model.UID),
-					},
-					PDGroup: pdGroup,
-				},
-				WorkloadPort: networking.WorkloadPort{
-					Port: 8000, // todo: get port from config
-				},
-				TrafficPolicy: &networking.TrafficPolicy{
-					Retry: &networking.Retry{
-						Attempts:      5,
-						RetryInterval: &metav1.Duration{Duration: time.Duration(0) * time.Second},
-					},
-				},
-				KVConnector: kvConnector,
-			},
-		}
-		modelServer.Labels = utils.GetModelControllerLabels(model, backend.Name, icUtils.Revision(modelServer.Spec))
-		modelServers = append(modelServers, &modelServer)
+	var backend = model.Spec.Backend
+	var inferenceEngine networking.InferenceEngine
+	switch backend.Type {
+	case workload.ModelBackendTypeVLLM, workload.ModelBackendTypeVLLMDisaggregated:
+		inferenceEngine = networking.VLLM
+	default:
+		return nil, fmt.Errorf("not support %s backend yet, please use vLLM backend", backend.Type)
 	}
+	servedModelName := getServedModelName(model, backend)
+	pdGroup := getPdGroup(backend)
+	kvConnector, err := getKvConnectorSpec(backend)
+	if err != nil {
+		return nil, err
+	}
+	modelServer := networking.ModelServer{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       networking.ModelServerKind,
+			APIVersion: networking.GroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      utils.GetBackendResourceName(model.Name, backend.Name),
+			Namespace: model.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				utils.NewModelOwnerRef(model),
+			},
+		},
+		Spec: networking.ModelServerSpec{
+			Model:           &servedModelName,
+			InferenceEngine: inferenceEngine,
+			WorkloadSelector: &networking.WorkloadSelector{
+				MatchLabels: map[string]string{
+					utils.OwnerUIDKey: string(model.UID),
+				},
+				PDGroup: pdGroup,
+			},
+			WorkloadPort: networking.WorkloadPort{
+				Port: 8000, // todo: get port from config
+			},
+			TrafficPolicy: &networking.TrafficPolicy{
+				Retry: &networking.Retry{
+					Attempts:      5,
+					RetryInterval: &metav1.Duration{Duration: time.Duration(0) * time.Second},
+				},
+			},
+			KVConnector: kvConnector,
+		},
+	}
+	modelServer.Labels = utils.GetModelControllerLabels(model, backend.Name, icUtils.Revision(modelServer.Spec))
+	modelServers = append(modelServers, &modelServer)
+
 	return modelServers, nil
 }
 
@@ -138,6 +136,9 @@ func getKvConnectorSpec(backend workload.ModelBackend) (*networking.KVConnectorS
 	}
 
 	if foundConfig {
+		if connectorType == nil {
+			return nil, fmt.Errorf("kv connector type found but nil")
+		}
 		return &networking.KVConnectorSpec{Type: *connectorType}, nil
 	}
 	return nil, nil
@@ -160,14 +161,14 @@ func getPdGroup(backend workload.ModelBackend) *networking.PDGroup {
 }
 
 // getServedModelName gets served model name from the worker config. Default is the model name.
-func getServedModelName(model *workload.ModelBooster, backend workload.ModelBackend) (string, error) {
+func getServedModelName(model *workload.ModelBooster, backend workload.ModelBackend) string {
 	servedModelName := model.Name
 	for _, worker := range backend.Workers {
 		if worker.Type == workload.ModelWorkerTypeServer ||
 			worker.Type == workload.ModelWorkerTypeDecode {
 			valStr, err := utils.TryGetField(worker.Config.Raw, "served-model-name")
 			if err != nil {
-				return "", err
+				return servedModelName
 			}
 			if valStr == nil {
 				continue
@@ -178,5 +179,5 @@ func getServedModelName(model *workload.ModelBooster, backend workload.ModelBack
 			}
 		}
 	}
-	return servedModelName, nil
+	return servedModelName
 }

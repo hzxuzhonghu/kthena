@@ -19,6 +19,7 @@ package utils
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,7 +28,7 @@ import (
 )
 
 var (
-	GPUCacheUsage     = "gpu_usage"
+	KVCacheUsage      = "kv_cache_usage"
 	RequestWaitingNum = "request_waiting_num"
 	RequestRunningNum = "request_running_num"
 	TPOT              = "TPOT"
@@ -41,13 +42,13 @@ func GetNamespaceName(obj metav1.Object) types.NamespacedName {
 	}
 }
 
-func ParsePrompt(body map[string]interface{}) (common.ChatMessage, error) {
+func ParsePrompt(body map[string]interface{}) (*common.ChatMessage, error) {
 	if prompt, ok := body["prompt"]; ok {
 		promptStr, ok := prompt.(string)
 		if !ok {
-			return common.ChatMessage{}, fmt.Errorf("prompt is not a string")
+			return nil, fmt.Errorf("prompt is not a string")
 		}
-		return common.ChatMessage{
+		return &common.ChatMessage{
 			Text: promptStr,
 		}, nil
 	}
@@ -55,10 +56,10 @@ func ParsePrompt(body map[string]interface{}) (common.ChatMessage, error) {
 	if messages, ok := body["messages"]; ok {
 		messageList, ok := messages.([]interface{})
 		if !ok {
-			return common.ChatMessage{}, fmt.Errorf("messages is not a list")
+			return nil, fmt.Errorf("messages is not a list")
 		}
 
-		var msgs []common.Message
+		msgs := make([]common.Message, 0, len(messageList))
 		for _, message := range messageList {
 			msgMap, ok := message.(map[string]interface{})
 			if !ok {
@@ -81,26 +82,26 @@ func ParsePrompt(body map[string]interface{}) (common.ChatMessage, error) {
 			})
 		}
 
-		return common.ChatMessage{
+		return &common.ChatMessage{
 			Messages: msgs,
 		}, nil
 	}
 
-	return common.ChatMessage{}, fmt.Errorf("prompt or messages not found in request body")
+	return nil, fmt.Errorf("prompt or messages not found in request body")
 }
 
-func GetPromptString(chatMessage common.ChatMessage) string {
+func GetPromptString(chatMessage *common.ChatMessage) string {
 	// If Text field is present, return text directly (for prompt format)
 	if chatMessage.Text != "" {
 		return chatMessage.Text
 	}
 
 	// For chat messages, convert to ChatML format
-	result := ""
+	var result strings.Builder
 	for _, msg := range chatMessage.Messages {
-		result += fmt.Sprintf("<|im_start|>%s\n%s<|im_end|>\n", msg.Role, msg.Content)
+		fmt.Fprintf(&result, "<|im_start|>%s\n%s<|im_end|>\n", msg.Role, msg.Content)
 	}
-	return result
+	return result.String()
 }
 
 func LoadEnv(key, defaultValue string) string {

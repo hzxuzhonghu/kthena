@@ -1,0 +1,73 @@
+# Canary DS1.5B mock backends for subset routing e2e tests.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek-r1-1-5b-v1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepseek-r1-1-5b
+      version: v1
+  template:
+    metadata:
+      labels:
+        app: deepseek-r1-1-5b
+        version: v1
+    spec:
+      containers:
+        - name: llm-engine
+          image: ghcr.io/llm-d/llm-d-inference-sim:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --model=kthena-mock-1.5b-v1
+            - --served-model-name=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+            - --port=8000
+            - --mode=echo
+            - --time-to-first-token=0
+            - --inter-token-latency=0
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 2
+            periodSeconds: 2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek-r1-1-5b-v2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepseek-r1-1-5b
+      version: v2
+  template:
+    metadata:
+      labels:
+        app: deepseek-r1-1-5b
+        version: v2
+    spec:
+      containers:
+        - name: llm-engine
+          image: ghcr.io/llm-d/llm-d-inference-sim:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --model=kthena-mock-1.5b-v2
+            - --served-model-name=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+            - --port=8000
+            - --mode=echo
+            - --time-to-first-token=0
+            - --inter-token-latency=0
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 2
+            periodSeconds: 2

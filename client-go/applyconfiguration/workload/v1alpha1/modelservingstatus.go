@@ -30,7 +30,10 @@ type ModelServingStatusApplyConfiguration struct {
 	CurrentReplicas    *int32                           `json:"currentReplicas,omitempty"`
 	UpdatedReplicas    *int32                           `json:"updatedReplicas,omitempty"`
 	AvailableReplicas  *int32                           `json:"availableReplicas,omitempty"`
+	CurrentRevision    *string                          `json:"currentRevision,omitempty"`
+	UpdateRevision     *string                          `json:"updateRevision,omitempty"`
 	Conditions         []v1.ConditionApplyConfiguration `json:"conditions,omitempty"`
+	LabelSelector      *string                          `json:"labelSelector,omitempty"`
 }
 
 // ModelServingStatusApplyConfiguration constructs a declarative configuration of the ModelServingStatus type for use with
@@ -79,6 +82,22 @@ func (b *ModelServingStatusApplyConfiguration) WithAvailableReplicas(value int32
 	return b
 }
 
+// WithCurrentRevision sets the CurrentRevision field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the CurrentRevision field is set to the value of the last call.
+func (b *ModelServingStatusApplyConfiguration) WithCurrentRevision(value string) *ModelServingStatusApplyConfiguration {
+	b.CurrentRevision = &value
+	return b
+}
+
+// WithUpdateRevision sets the UpdateRevision field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the UpdateRevision field is set to the value of the last call.
+func (b *ModelServingStatusApplyConfiguration) WithUpdateRevision(value string) *ModelServingStatusApplyConfiguration {
+	b.UpdateRevision = &value
+	return b
+}
+
 // WithConditions adds the given value to the Conditions field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the Conditions field.
@@ -89,5 +108,13 @@ func (b *ModelServingStatusApplyConfiguration) WithConditions(values ...*v1.Cond
 		}
 		b.Conditions = append(b.Conditions, *values[i])
 	}
+	return b
+}
+
+// WithLabelSelector sets the LabelSelector field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the LabelSelector field is set to the value of the last call.
+func (b *ModelServingStatusApplyConfiguration) WithLabelSelector(value string) *ModelServingStatusApplyConfiguration {
+	b.LabelSelector = &value
 	return b
 }

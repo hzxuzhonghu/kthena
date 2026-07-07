@@ -25,14 +25,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/pflag"
-	clientset "github.com/volcano-sh/kthena/client-go/clientset/versioned"
+	autoscalerwebhook "github.com/volcano-sh/kthena/pkg/autoscaler/webhook"
 	"github.com/volcano-sh/kthena/pkg/controller"
-	"github.com/volcano-sh/kthena/pkg/model-booster-webhook/handlers"
-	"github.com/volcano-sh/kthena/pkg/model-serving-controller/webhook"
+	modelboosterwebhook "github.com/volcano-sh/kthena/pkg/model-booster-controller/webhook"
+	modelservingwebhook "github.com/volcano-sh/kthena/pkg/model-serving-controller/webhook"
+	webhookcert "github.com/volcano-sh/kthena/pkg/webhook/cert"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 )
@@ -42,26 +45,48 @@ type webhookConfig struct {
 	tlsPrivateKey  string
 	port           int
 	webhookTimeout int
+	certSecretName string
+	serviceName    string
+	kubeAPIQPS     float32
+	kubeAPIBurst   int
 }
 
 func main() {
 	var enableWebhook bool
 	var wc webhookConfig
 	var cc controller.Config
+	var controllers []string
 	// Initialize klog flags
 	klog.InitFlags(nil)
+	// Opt into fixed stderrthreshold behavior (kubernetes/klog#212).
+	if err := flag.CommandLine.Set("legacy_stderr_threshold_behavior", "false"); err != nil {
+		klog.Fatalf("Failed to set legacy_stderr_threshold_behavior: %v", err)
+	}
+	if err := flag.CommandLine.Set("stderrthreshold", "INFO"); err != nil {
+		klog.Fatalf("Failed to set stderrthreshold: %v", err)
+	}
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	pflag.StringVar(&cc.Kubeconfig, "kubeconfig", "", "kubeconfig file path")
 	pflag.BoolVar(&enableWebhook, "enable-webhook", true, "If true, webhook will be used. Default is true")
 	pflag.StringVar(&cc.MasterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
-	pflag.StringVar(&wc.tlsCertFile, "tls-cert-file", "/etc/webhook/certs/tls.crt", "File containing the x509 Certificate for HTTPS. This can be used as a fallback when cert-manager is not available.")
-	pflag.StringVar(&wc.tlsPrivateKey, "tls-private-key-file", "/etc/webhook/certs/tls.key", "File containing the x509 private key to --tls-cert-file. This can be used as a fallback when cert-manager is not available.")
+	pflag.StringVar(&wc.tlsCertFile, "tls-cert-file", "/etc/tls/tls.crt", "File containing the x509 Certificate for HTTPS")
+	pflag.StringVar(&wc.tlsPrivateKey, "tls-private-key-file", "/etc/tls/tls.key", "File containing the x509 private key to --tls-cert-file")
 	pflag.IntVar(&wc.port, "port", 8443, "Secure port that the webhook listens on")
 	pflag.IntVar(&wc.webhookTimeout, "webhook-timeout", 30, "Timeout for webhook operations in seconds")
+	pflag.StringVar(&wc.certSecretName, "cert-secret-name", "kthena-controller-manager-webhook-certs", "Name of the secret to store auto-generated certificates")
+	pflag.StringVar(&wc.serviceName, "service-name", "kthena-controller-manager-webhook", "Service name for the webhook server")
 	pflag.BoolVar(&cc.EnableLeaderElection, "leader-elect", false, "Enable leader election for controller. "+
 		"Enabling this will ensure there is only one active controller. Default is false.")
 	pflag.IntVar(&cc.Workers, "workers", 5, "number of workers to run. Default is 5")
+	pflag.StringSliceVar(&controllers, "controllers", []string{"*"}, "A list of controllers to enable. '*' enables all controllers, 'foo' enables the controller "+
+		"named 'foo', '-foo' disables the controller named 'foo'.\nIf both '+foo' and '-foo' are set simultaneously, then controller named 'foo' will be enabled.\nAll controllers: 'modelserving', 'modelbooster', 'autoscaler'")
+	pflag.Float32Var(&cc.KubeAPIQPS, "kube-api-qps", 0, "QPS to use while talking with kubernetes apiserver. If 0, use default value.")
+	pflag.IntVar(&cc.KubeAPIBurst, "kube-api-burst", 0, "Burst to use while talking with kubernetes apiserver. If 0, use default value.")
+	pflag.IntVar(&cc.DebugPort, "debug-port", 0, "Port for debug server to dump internal cache. If 0, debug server is disabled.")
 	pflag.Parse()
+
+	cc.Controllers = parseControllers(controllers)
+
 	pflag.CommandLine.VisitAll(func(f *pflag.Flag) {
 		klog.Infof("Flag: %s, Value: %s", f.Name, f.Value.String())
 	})
@@ -74,6 +99,8 @@ func main() {
 		klog.Info("Received termination, signaling shutdown")
 		cancel()
 	}()
+	wc.kubeAPIQPS = cc.KubeAPIQPS
+	wc.kubeAPIBurst = cc.KubeAPIBurst
 	if enableWebhook {
 		go func() {
 			if err := setupWebhook(ctx, wc); err != nil {
@@ -84,33 +111,86 @@ func main() {
 	controller.SetupController(ctx, cc)
 }
 
+const validatingWebhookName = "kthena-controller-manager-validating-webhook"
+const mutatingWebhookName = "kthena-controller-manager-mutating-webhook"
+
+// ensureWebhookCertificate generates a certificate into the secret and returns the CA bundle.
+func ensureWebhookCertificate(ctx context.Context, kubeClient kubernetes.Interface, wc webhookConfig) ([]byte, error) {
+	namespace := getNamespace()
+	dnsNames := []string{
+		fmt.Sprintf("%s.%s.svc", wc.serviceName, namespace),
+		fmt.Sprintf("%s.%s.svc.cluster.local", wc.serviceName, namespace),
+	}
+	klog.Infof("Auto-generating certificate for webhook server (secret=%s service=%s)", wc.certSecretName, wc.serviceName)
+	return webhookcert.EnsureCertificate(ctx, kubeClient, namespace, wc.certSecretName, dnsNames)
+}
+
 func setupWebhook(ctx context.Context, wc webhookConfig) error {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		klog.Fatalf("build client config: %v", err)
 		return err
 	}
-	kthenaClient, err := clientset.NewForConfig(cfg)
+	// Set QPS and Burst if provided
+	if wc.kubeAPIQPS > 0 {
+		cfg.QPS = wc.kubeAPIQPS
+	}
+	if wc.kubeAPIBurst > 0 {
+		cfg.Burst = wc.kubeAPIBurst
+	}
+
+	kubeClient, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		klog.Fatalf("failed to create kthenaClient: %v", err)
+		klog.Fatalf("failed to create kubeClient: %v", err)
 		return err
+	}
+
+	// Secret -> File -> Generate precedence for CA bundle selection
+	namespace := getNamespace()
+	var caBundle []byte
+
+	// 1. Try secret first.
+	if bundle, err := webhookcert.LoadCertBundleFromSecret(ctx, kubeClient, namespace, wc.certSecretName); err != nil {
+		klog.Warningf("Error reading CA bundle from secret %s: %v", wc.certSecretName, err)
+	} else if bundle != nil {
+		klog.Infof("Loaded CA bundle from secret %s", wc.certSecretName)
+		caBundle = bundle.CAPEM
+	}
+
+	// 2. If not from secret, try existing cert file.
+	if caBundle == nil {
+		if !fileExists(wc.tlsPrivateKey) || !fileExists(wc.tlsCertFile) {
+			b, err := ensureWebhookCertificate(ctx, kubeClient, wc)
+			if err != nil {
+				klog.Fatalf("Failed to auto-generate webhook certificates: %v", err)
+			}
+			caBundle = b
+		}
+	}
+
+	if caBundle != nil {
+		// Always update both webhook configurations with the chosen CA bundle
+		if err := webhookcert.UpdateValidatingWebhookCABundle(ctx, kubeClient, validatingWebhookName, caBundle); err != nil {
+			klog.Warningf("Failed to update ValidatingWebhookConfiguration CA bundle: %v", err)
+		}
+		if err := webhookcert.UpdateMutatingWebhookCABundle(ctx, kubeClient, mutatingWebhookName, caBundle); err != nil {
+			klog.Warningf("Failed to update MutatingWebhookConfiguration CA bundle: %v", err)
+		}
 	}
 
 	mux := http.NewServeMux()
 
-	modelServingValidator := webhook.NewModelServingValidator()
-	mux.HandleFunc("/validate-workload-ai-v1alpha1-modelServing", modelServingValidator.Handle)
+	modelServingValidator := modelservingwebhook.NewModelServingValidator()
+	mux.HandleFunc("/validate-workload-ai-v1alpha1-modelserving", modelServingValidator.Handle)
 
-	modelValidator := handlers.NewModelValidator()
-	modelMutator := handlers.NewModelMutator()
-	autoscalingPolicyValidator := handlers.NewAutoscalingPolicyValidator()
-	autoscalingPolicyMutator := handlers.NewAutoscalingPolicyMutator()
-	autoscalingBindingValidator := handlers.NewAutoscalingBindingValidator(kthenaClient)
-	mux.HandleFunc("/validate-registry-volcano-sh-v1alpha1-model", modelValidator.Handle)
-	mux.HandleFunc("/mutate-registry-volcano-sh-v1alpha1-model", modelMutator.Handle)
-	mux.HandleFunc("/validate-registry-volcano-sh-v1alpha1-autoscalingpolicy", autoscalingPolicyValidator.Handle)
-	mux.HandleFunc("/mutate-registry-volcano-sh-v1alpha1-autoscalingpolicy", autoscalingPolicyMutator.Handle)
-	mux.HandleFunc("/validate-registry-volcano-sh-v1alpha1-autoscalingpolicybinding", autoscalingBindingValidator.Handle)
+	modelValidator := modelboosterwebhook.NewModelValidator()
+	modelMutator := modelboosterwebhook.NewModelMutator()
+	autoscalingPolicyValidator := autoscalerwebhook.NewAutoscalingPolicyValidator()
+	autoscalingPolicyMutator := autoscalerwebhook.NewAutoscalingPolicyMutator()
+	mux.HandleFunc("/validate/modelbooster", modelValidator.Handle)
+	mux.HandleFunc("/mutate/modelbooster", modelMutator.Handle)
+	mux.HandleFunc("/validate/autoscalingpolicy", autoscalingPolicyValidator.Handle)
+	mux.HandleFunc("/mutate/autoscalingpolicy", autoscalingPolicyMutator.Handle)
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -129,6 +209,12 @@ func setupWebhook(ctx context.Context, wc webhookConfig) error {
 		},
 	}
 
+	// Wait for both cert and key files to exist (in case they are mounted by Kubernetes)
+	ok := waitForCertsReady(wc.tlsPrivateKey, wc.tlsCertFile)
+	if !ok {
+		return fmt.Errorf("TLS cert/key files not found, webhook server cannot start")
+	}
+
 	go func() {
 		klog.Infof("Starting webhook server on %s", server.Addr)
 		if err := server.ListenAndServeTLS(wc.tlsCertFile, wc.tlsPrivateKey); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -140,4 +226,99 @@ func setupWebhook(ctx context.Context, wc webhookConfig) error {
 	defer cancel()
 	_ = server.Shutdown(ctxTimeout)
 	return nil
+}
+
+// getNamespace returns the current pod namespace or "default".
+func getNamespace() string {
+	return os.Getenv("POD_NAMESPACE")
+}
+
+// fileExists returns true if the file exists.
+func fileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func waitForCertsReady(keyFile, CertFile string) bool {
+	waitTimeout := 30 * time.Second
+	waitInterval := 500 * time.Millisecond
+	start := time.Now()
+	for {
+		if fileExists(CertFile) && fileExists(keyFile) {
+			return true
+		}
+		if time.Since(start) > waitTimeout {
+			klog.Warningf("timeout waiting for TLS cert/key files to appear at %s and %s", keyFile, CertFile)
+			return false
+		}
+		time.Sleep(waitInterval)
+	}
+}
+
+func parseControllers(controllers []string) map[string]bool {
+	// defaultControllers defines all available controllers as enabled
+	defaultControllers := map[string]bool{
+		controller.ModelServingController: true,
+		controller.ModelBoosterController: true,
+		controller.AutoscalerController:   true,
+	}
+
+	enableControllers := make(map[string]bool)
+
+	for i := range controllers {
+		controllers[i] = strings.TrimSpace(controllers[i])
+		if controllers[i] == "" {
+			continue
+		}
+	}
+
+	for ctrlName := range defaultControllers {
+		// Determine if the controller should be enabled based on user input
+		if isControllerEnabled(ctrlName, controllers) {
+			enableControllers[ctrlName] = true
+		} else {
+			klog.Infof("Controller <%s> is disabled", ctrlName)
+		}
+	}
+
+	if len(enableControllers) == 0 {
+		klog.Warning("No controllers are enabled")
+		return defaultControllers
+	}
+
+	return enableControllers
+}
+
+// isControllerEnabled check if a specified controller enabled or not.
+// If the input controllers starts with a "+name" or "name", it is considered as an explicit inclusion.
+// Otherwise, it is considered as an explicit exclusion.
+func isControllerEnabled(name string, controllers []string) bool {
+	// Because controllers are enabled by default, the default return value is true.
+	hasStar := false
+	// if no explicit inclusion or exclusion, enable all controllers by default
+	if len(controllers) == 0 {
+		return true
+	}
+	for _, ctrl := range controllers {
+		// if we get here, there was an explicit inclusion
+		if ctrl == name {
+			return true
+		}
+		// if we get here, there was an explicit inclusion
+		if ctrl == "+"+name {
+			return true
+		}
+		// if we get here, there was an explicit exclusion
+		if ctrl == "-"+name {
+			return false
+		}
+		if ctrl == "*" {
+			hasStar = true
+		}
+	}
+	// if we get here, there was no explicit inclusion or exclusion
+	return hasStar
 }

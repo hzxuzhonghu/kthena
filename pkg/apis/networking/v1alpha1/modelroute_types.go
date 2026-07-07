@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 // ModelRouteSpec defines the desired state of ModelRoute.
@@ -25,7 +26,7 @@ import (
 type ModelRouteSpec struct {
 	// `model` in the LLM request, it could be a base model name, lora adapter name or even
 	// a virtual model name. This field is used to match scenarios other than model adapter name and
-	// this field could be empty, but it and  `ModelAdapters` can't both be empty.
+	// this field could be empty, but it and `ModelAdapters` can't both be empty.
 	//
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="modelName is immutable"
 	ModelName string `json:"modelName,omitempty"`
@@ -35,6 +36,11 @@ type ModelRouteSpec struct {
 	//
 	// +kubebuilder:validation:MaxItems=10
 	LoraAdapters []string `json:"loraAdapters,omitempty"`
+
+	// ParentRefs references the Gateways that this ModelRoute should be attached to.
+	// If empty, the ModelRoute will be attached to all Gateways in the same namespace.
+	// +optional
+	ParentRefs []gatewayv1.ParentReference `json:"parentRefs,omitempty"`
 
 	// An ordered list of route rules for LLM traffic. The first rule
 	// matching an incoming request will be used.
@@ -57,6 +63,7 @@ type Rule struct {
 	// Empty `modelMatch` means matching all requests.
 	// +optional
 	ModelMatch *ModelMatch `json:"modelMatch,omitempty"`
+	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
 	TargetModels []*TargetModel `json:"targetModels"`
 }

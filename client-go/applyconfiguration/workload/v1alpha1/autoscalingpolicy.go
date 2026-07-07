@@ -19,7 +19,6 @@ limitations under the License.
 package v1alpha1
 
 import (
-	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
 	v1 "k8s.io/client-go/applyconfigurations/meta/v1"
@@ -30,8 +29,8 @@ import (
 type AutoscalingPolicyApplyConfiguration struct {
 	v1.TypeMetaApplyConfiguration    `json:",inline"`
 	*v1.ObjectMetaApplyConfiguration `json:"metadata,omitempty"`
-	Spec                             *AutoscalingPolicySpecApplyConfiguration  `json:"spec,omitempty"`
-	Status                           *workloadv1alpha1.AutoscalingPolicyStatus `json:"status,omitempty"`
+	Spec                             *AutoscalingPolicySpecApplyConfiguration   `json:"spec,omitempty"`
+	Status                           *AutoscalingPolicyStatusApplyConfiguration `json:"status,omitempty"`
 }
 
 // AutoscalingPolicy constructs a declarative configuration of the AutoscalingPolicy type for use with
@@ -44,6 +43,7 @@ func AutoscalingPolicy(name, namespace string) *AutoscalingPolicyApplyConfigurat
 	b.WithAPIVersion("workload.serving.volcano.sh/v1alpha1")
 	return b
 }
+func (b AutoscalingPolicyApplyConfiguration) IsApplyConfiguration() {}
 
 // WithKind sets the Kind field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
@@ -214,13 +214,29 @@ func (b *AutoscalingPolicyApplyConfiguration) WithSpec(value *AutoscalingPolicyS
 // WithStatus sets the Status field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Status field is set to the value of the last call.
-func (b *AutoscalingPolicyApplyConfiguration) WithStatus(value workloadv1alpha1.AutoscalingPolicyStatus) *AutoscalingPolicyApplyConfiguration {
-	b.Status = &value
+func (b *AutoscalingPolicyApplyConfiguration) WithStatus(value *AutoscalingPolicyStatusApplyConfiguration) *AutoscalingPolicyApplyConfiguration {
+	b.Status = value
 	return b
+}
+
+// GetKind retrieves the value of the Kind field in the declarative configuration.
+func (b *AutoscalingPolicyApplyConfiguration) GetKind() *string {
+	return b.TypeMetaApplyConfiguration.Kind
+}
+
+// GetAPIVersion retrieves the value of the APIVersion field in the declarative configuration.
+func (b *AutoscalingPolicyApplyConfiguration) GetAPIVersion() *string {
+	return b.TypeMetaApplyConfiguration.APIVersion
 }
 
 // GetName retrieves the value of the Name field in the declarative configuration.
 func (b *AutoscalingPolicyApplyConfiguration) GetName() *string {
 	b.ensureObjectMetaApplyConfigurationExists()
 	return b.ObjectMetaApplyConfiguration.Name
+}
+
+// GetNamespace retrieves the value of the Namespace field in the declarative configuration.
+func (b *AutoscalingPolicyApplyConfiguration) GetNamespace() *string {
+	b.ensureObjectMetaApplyConfigurationExists()
+	return b.ObjectMetaApplyConfiguration.Namespace
 }

@@ -18,20 +18,38 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	volcanoV1Beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 )
 
 // GangPolicy defines the gang scheduling configuration.
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.minRoleReplicas) || has(self.minRoleReplicas)", message="minRoleReplicas is required once set"
 type GangPolicy struct {
 	// MinRoleReplicas defines the minimum number of replicas required for each role
-	// in gang scheduling. This map allows users to specify different
-	// minimum replica requirements for different roles.
-	// Key: role name
-	// Value: minimum number of replicas required for that role
+	// in gang scheduling, pods in each role are strictly gang required.
+	// This map allows users to specify different minimum replica requirements for different roles.
+	// If this field is not set, all roles in the ServingGroup are considered gang required by default.
+	// For example if you specify a 2P(prefill) 4D(decode) serving group and set the below gangPolicy:
+	// ```yaml
+	// gangPolicy:
+	//   minRoleReplicas:
+	//     prefill: 1
+	//     decode: 1
+	// ```
+	// It will result in the following behavior:
+	// At least one prefill and one decode must be scheduled before any of the pods in the serving group can run.
+	// And pods within a role must be scheduled together.
 	// +optional
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf", message="minRoleReplicas is immutable"
 	MinRoleReplicas map[string]int32 `json:"minRoleReplicas,omitempty"`
+}
+
+// NetworkTopologySpec defines the network topology affinity scheduling policy for the roles and group, it works only when the scheduler supports network topology feature.
+type NetworkTopology struct {
+	// GroupPolicy defines the network topology scheduling requirement of  all the instances within the `ServingGroup`.
+	GroupPolicy *volcanoV1Beta1.NetworkTopologySpec `json:"groupPolicy,omitempty"`
+
+	// RolePolicy defines the fine-grained network topology scheduling requirement for instances of a `role`.
+	RolePolicy *volcanoV1Beta1.NetworkTopologySpec `json:"rolePolicy,omitempty"`
 }
 
 // Role defines the specific pod instance role that performs the inference task.
@@ -60,6 +78,15 @@ type Role struct {
 	// WorkerTemplate defines the template for the worker pod of a role.
 	// +optional
 	WorkerTemplate *PodTemplateSpec `json:"workerTemplate,omitempty"`
+
+	// MaxUnavailable is the maximum number of replicas of this Role that can be
+	// unavailable during a RoleRollingUpdate. Value can be an absolute number (ex: 2)
+	// or a percentage of this Role's replicas (ex: 50%). Percentages are rounded down.
+	// This field is only valid when rolloutStrategy.type is RoleRollingUpdate.
+	// When unset, all outdated replicas of this Role are recreated at once.
+	// +kubebuilder:validation:XIntOrString
+	// +optional
+	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
 }
 
 // PodTemplateSpec describes the data a pod should have when created from a template
@@ -101,8 +128,10 @@ type ServingGroup struct {
 	// +optional
 	GangPolicy *GangPolicy `json:"gangPolicy,omitempty"`
 
-	// NetworkTopology defines the network topology affinity scheduling policy for the roles of the group, it works only when the scheduler supports network topology feature.	// +optional
-	NetworkTopology *volcanoV1Beta1.NetworkTopologySpec `json:"networkTopology,omitempty"`
+	// NetworkTopology defines the network topology affinity scheduling policy for the roles of the `ServingGroup`,
+	// it works only when the scheduler supports network topology-aware scheduling.
+	// +optional
+	NetworkTopology *NetworkTopology `json:"networkTopology,omitempty"`
 
 	// +kubebuilder:validation:MaxItems=4
 	// +kubebuilder:validation:MinItems=1

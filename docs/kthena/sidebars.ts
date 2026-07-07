@@ -19,7 +19,7 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Getting Started',
-      items: ['getting-started/quick-start', 'getting-started/installation'],
+      items: ['getting-started/installation', 'getting-started/quick-start'],
     },
     {
       type: 'category',
@@ -44,22 +44,68 @@ const sidebars: SidebarsConfig = {
         description: 'A comprehensive overview of all the user guides.',
       },
       items: [
-        'user-guide/model-booster',
-        'user-guide/router-routing',
+        {
+          type: 'category',
+          label: 'Model Deployment',
+          link: {
+            type: 'doc',
+            id: 'user-guide/model-deployment',
+          },
+          items: [
+            'user-guide/lws-integration',
+            'user-guide/modelserving-plugin-framework',
+          ],
+        },
         'user-guide/multi-node-inference',
-        'user-guide/config-router',
-        'user-guide/autoscaler',
-        'user-guide/rate-limit',
+        'user-guide/network-topology',
+        {
+          type: 'doc',
+          label: 'Autoscaler',
+          id: 'user-guide/autoscaler',
+        },
+        {
+          type: 'category',
+          label: 'workload',
+          items: [
+            'user-guide/binpack-scale-down',
+            'user-guide/gang-scheduling',
+            'user-guide/network-topology',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Router',
+          items: [
+            'user-guide/router-routing',
+            'user-guide/config-router',
+            'user-guide/kvcache-aware',
+            'user-guide/fairness-scheduling',
+            'user-guide/session-boost',
+            'user-guide/rate-limit',
+            "user-guide/gateway-api-support",
+            'user-guide/gateway-inference-extension-support',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Observability',
+          items: [
+            'user-guide/router-observability',
+          ],
+        },
         'user-guide/runtime',
+        'user-guide/binpack-scale-down',
         {
           type: 'category',
           label: 'Prefill Decode Disaggregation',
           link: {
             type: 'doc',
-            id: 'user-guide/prefill-decode-disaggregation/prefill-decode-disaggregation'
+            id: 'user-guide/prefill-decode-disaggregation/prefill-decode-disaggregation',
           },
           items: [
             'user-guide/prefill-decode-disaggregation/vllm-ascend-mooncake',
+            'user-guide/prefill-decode-disaggregation/sglang-pd-disaggregation',
+            'user-guide/prefill-decode-disaggregation/vllm-pd-disaggregation',
           ],
         },
       ],
@@ -67,12 +113,13 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'General',
-      items: ['general/prometheus', 'general/cert-manager', 'general/faq'],
+      items: ['general/cert-manager', 'general/faq', 'general/data-parallel-deployment'],
     },
     {
       type: 'category',
       label: 'Developer Guide',
       items: [
+        'developer-guide/development-setup',
         'developer-guide/release',
         'developer-guide/model-serving-rolling-update',
         'developer-guide/ci',
@@ -90,8 +137,8 @@ const sidebars: SidebarsConfig = {
       items: [
         {
           type: 'doc',
-          id: 'reference/router-access-log-fields',
-          label: 'Router Access Log Fields',
+          id: 'reference/helm-chart-values',
+          label: 'Helm Chart Values',
         },
         {
           type: 'category',
@@ -109,21 +156,62 @@ const sidebars: SidebarsConfig = {
             },
           ],
         },
-        // TODO: show CLI doc after CLI renaming
-        // {
-        //   type: 'category',
-        //   label: 'Minfer CLI',
-        //   items: [
-        //     { type: 'doc', id: 'reference/cli/minfer', label: 'Minfer' },
-        //     { type: 'doc', id: 'reference/cli/minfer_create', label: 'Create' },
-        //     { type: 'doc', id: 'reference/cli/minfer_get', label: 'Get' },
-        //     {
-        //       type: 'doc',
-        //       id: 'reference/cli/minfer_describe',
-        //       label: 'Describe',
-        //     },
-        //   ],
-        // },
+        {
+          type: 'category',
+          label: 'Kthena CLI',
+          link: {
+            type: 'doc',
+            id: 'reference/kthena-cli',
+          },
+          items: [
+            { type: 'doc', id: 'reference/kthena-cli/kthena', label: 'Kthena' },
+            {
+              type: 'category',
+              label: 'Create',
+              link: {
+                type: 'doc',
+                id: 'reference/kthena-cli/kthena_create',
+              },
+              items: [
+                { type: 'doc', id: 'reference/kthena-cli/kthena_create_manifest', label: 'Create manifest' },
+              ],
+            },
+            {
+              type: 'category',
+              label: 'Get',
+              link: {
+                type: 'doc',
+                id: 'reference/kthena-cli/kthena_get',
+              },
+              items: [
+                { type: 'doc', id: 'reference/kthena-cli/kthena_get_autoscaling-policies', label: 'Get autoscaling-policies' },
+                { type: 'doc', id: 'reference/kthena-cli/kthena_get_model-boosters', label: 'Get model-boosters' },
+                { type: 'doc', id: 'reference/kthena-cli/kthena_get_model-servings', label: 'Get model-servings' },
+                { type: 'doc', id: 'reference/kthena-cli/kthena_get_template', label: 'Get template' },
+                { type: 'doc', id: 'reference/kthena-cli/kthena_get_templates', label: 'Get templates' },
+              ],
+            },
+            {
+              type: 'category',
+              label: 'Describe',
+              link: {
+                type: 'doc',
+                id: 'reference/kthena-cli/kthena_describe',
+              },
+              items: [
+                { type: 'doc', id: 'reference/kthena-cli/kthena_describe_autoscaling-policy', label: 'Describe autoscaling-policy' },
+                { type: 'doc', id: 'reference/kthena-cli/kthena_describe_model-booster', label: 'Describe model-booster' },
+                { type: 'doc', id: 'reference/kthena-cli/kthena_describe_model-serving', label: 'Describe model-serving' },
+                { type: 'doc', id: 'reference/kthena-cli/kthena_describe_template', label: 'Describe template' },
+              ],
+            },
+          ],
+        },
+        {
+          type: 'doc',
+          id: 'reference/router-access-log-fields',
+          label: 'Router Access Log Fields',
+        },
       ],
     },
   ],

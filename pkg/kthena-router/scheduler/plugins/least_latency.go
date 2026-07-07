@@ -19,9 +19,9 @@ package plugins
 import (
 	"math"
 
-	"github.com/stretchr/testify/assert/yaml"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/yaml"
 
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/framework"
@@ -45,7 +45,7 @@ type LeastLatencyArgs struct {
 
 func NewLeastLatency(pluginArg runtime.RawExtension) *LeastLatency {
 	var leastLatencyArgs LeastLatencyArgs
-	if yaml.Unmarshal(pluginArg.Raw, &leastLatencyArgs) != nil {
+	if pluginArg.Raw == nil || yaml.Unmarshal(pluginArg.Raw, &leastLatencyArgs) != nil {
 		klog.Errorf("Unmarshal LeastLatencyArgs error, setting default value")
 		leastLatencyArgs = LeastLatencyArgs{
 			0.5,
@@ -78,14 +78,23 @@ func (l *LeastLatency) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	// 2. Second pass: Compute scores using linear normalization
 	// Note: If all pods have identical latency (max == min), all pods get MaxScore
 	for _, info := range pods {
+		ttft := info.GetTTFT()
+		tpot := info.GetTPOT()
+		// Pods with no observed latency yet (zero default) are uninitialized — assign a
+		// neutral mid-range score so they receive some traffic via other plugins without
+		// monopolizing dispatch ahead of warm, measured replicas.
+		if ttft <= 0 || tpot <= 0 {
+			scoreResults[info] = int(MaxScore / 2)
+			continue
+		}
 		scoreTTFT := MaxScore
 		scoreTPOT := MaxScore
 		// Only compute normalized score if there's variance in latency values
 		if maxTTFT > minTTFT {
-			scoreTTFT = MaxScore * (maxTTFT - info.TTFT) / (maxTTFT - minTTFT)
+			scoreTTFT = MaxScore * (maxTTFT - ttft) / (maxTTFT - minTTFT)
 		}
 		if maxTPOT > minTPOT {
-			scoreTPOT = MaxScore * (maxTPOT - info.TPOT) / (maxTPOT - minTPOT)
+			scoreTPOT = MaxScore * (maxTPOT - tpot) / (maxTPOT - minTPOT)
 		}
 		scoreResults[info] = int(scoreTTFT*l.TTFTTPOTWeightFactor + scoreTPOT*(1-l.TTFTTPOTWeightFactor))
 	}
@@ -100,25 +109,27 @@ func calculateMinMaxMetrics(pods []*datastore.PodInfo) (minTTFT, maxTTFT, minTPO
 	maxTPOT = 0.0
 
 	for _, info := range pods {
-		// Skip pods with invalid values
-		if info.TTFT < 0 || info.TPOT < 0 {
+		ttft := info.GetTTFT()
+		tpot := info.GetTPOT()
+		// Skip pods with no observed data (zero is the uninitialized default, not a valid measurement)
+		if ttft <= 0 || tpot <= 0 {
 			continue
 		}
 
 		// Update TTFT min/max
-		if info.TTFT < minTTFT {
-			minTTFT = info.TTFT
+		if ttft < minTTFT {
+			minTTFT = ttft
 		}
-		if info.TTFT > maxTTFT {
-			maxTTFT = info.TTFT
+		if ttft > maxTTFT {
+			maxTTFT = ttft
 		}
 
 		// Update TPOT min/max
-		if info.TPOT < minTPOT {
-			minTPOT = info.TPOT
+		if tpot < minTPOT {
+			minTPOT = tpot
 		}
-		if info.TPOT > maxTPOT {
-			maxTPOT = info.TPOT
+		if tpot > maxTPOT {
+			maxTPOT = tpot
 		}
 	}
 

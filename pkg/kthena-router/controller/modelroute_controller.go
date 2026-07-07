@@ -36,7 +36,7 @@ import (
 type ModelRouteController struct {
 	modelRouteLister listerv1alpha1.ModelRouteLister
 	modelRouteSynced cache.InformerSynced
-	registation      cache.ResourceEventHandlerRegistration
+	registration     cache.ResourceEventHandlerRegistration
 
 	workqueue   workqueue.TypedRateLimitingInterface[any]
 	initialSync *atomic.Bool
@@ -46,7 +46,7 @@ type ModelRouteController struct {
 func NewModelRouteController(
 	kthenaInformerFactory informersv1alpha1.SharedInformerFactory,
 	store datastore.Store,
-) *ModelRouteController {
+) (*ModelRouteController, error) {
 	modelRouteInformer := kthenaInformerFactory.Networking().V1alpha1().ModelRoutes()
 
 	controller := &ModelRouteController{
@@ -57,22 +57,26 @@ func NewModelRouteController(
 		store:            store,
 	}
 
-	controller.registation, _ = modelRouteInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	var err error
+	controller.registration, err = modelRouteInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.enqueueModelRoute,
 		UpdateFunc: func(old, new interface{}) {
 			controller.enqueueModelRoute(new)
 		},
 		DeleteFunc: controller.enqueueModelRoute,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to add event handler for modelroute controller: %w", err)
+	}
 
-	return controller
+	return controller, nil
 }
 
 func (c *ModelRouteController) Run(stopCh <-chan struct{}) error {
 	defer utilruntime.HandleCrash()
 	defer c.workqueue.ShutDown()
 
-	if ok := cache.WaitForCacheSync(stopCh, c.registation.HasSynced); !ok {
+	if ok := cache.WaitForCacheSync(stopCh, c.registration.HasSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 	// add initialSync signal

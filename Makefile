@@ -50,7 +50,8 @@ gen-crd: controller-gen
 	$(CONTROLLER_GEN) crd paths="./pkg/apis/workload/..." output:crd:artifacts:config=charts/kthena/charts/workload/crds
 
 .PHONY: gen-docs
-gen-docs: crd-ref-docs ## Generate CRD and CLI reference documentation
+gen-docs: crd-ref-docs helm-docs ## Generate CRD and CLI reference documentation
+    # Generate CRD ref docs
 	mkdir -p docs/kthena/docs/api
 	$(CRD_REF_DOCS) \
 		--source-path=./pkg/apis \
@@ -58,14 +59,22 @@ gen-docs: crd-ref-docs ## Generate CRD and CLI reference documentation
 		--output-path=docs/kthena/docs/reference/crd \
 		--renderer=markdown \
 		--output-mode=group
-	# Generate Minfer CLI docs using a standalone doc-gen program
-	go run ./cli/minfer/internal/tools/docgen/main.go
+	# Generate Kthena CLI docs using a standalone doc-gen program
+	go run ./cli/kthena/internal/tools/docgen/main.go
+	# Generate Helm Chart docs
+	$(HELM_DOCS) \
+		--chart-search-root=charts/kthena \
+		--template-files=charts/kthena/README.md.gotmpl \
+		--dry-run \
+		> docs/kthena/docs/reference/helm-chart-values.md
 
 .PHONY: generate
-generate: controller-gen gen-crd gen-docs gen-copyright ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+generate: gen-crd ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 	go mod tidy
 	./hack/update-codegen.sh
+	$(MAKE) gen-docs
+	$(MAKE) gen-copyright
 
 .PHONY: gen-check
 gen-check: generate
@@ -75,6 +84,51 @@ gen-check: generate
 test: generate ## Run tests. Exclude e2e, client-go.
 	go test $$(go list ./... | grep -v /e2e | grep -v /client-go) -coverprofile cover.out
 
+.PHONY: test-docs
+test-docs: ## Run documentation tests (type check and build)
+	cd docs/kthena && npm run typecheck
+	cd docs/kthena && npm run build
+
+.PHONY: test-e2e
+test-e2e: ## Run all e2e tests sequentially (legacy).
+	@command -v kind >/dev/null 2>&1 || { \
+		echo "Kind is not installed. Please install Kind manually."; \
+		exit 1; \
+	}
+	@echo "Setting up Kind cluster for E2E tests..."
+	@./test/e2e/setup.sh
+	@echo "Running E2E tests sequentially..."
+	@KUBECONFIG=/tmp/kubeconfig-e2e go test -p 1 $$(go list ./... | grep /test/e2e) -v -timeout=15m
+	@echo "E2E tests completed"
+
+.PHONY: test-e2e-controller-manager
+test-e2e-controller-manager: ## Run controller-manager e2e tests.
+	@command -v kind >/dev/null 2>&1 || { echo "Kind is not installed."; exit 1; }
+	@TEST_CATEGORY=controller-manager ./test/e2e/setup.sh
+	@KUBECONFIG=/tmp/kubeconfig-e2e go test -v -timeout=20m ./test/e2e/controller-manager/...
+
+.PHONY: test-e2e-router
+test-e2e-router: ## Run router e2e tests.
+	@command -v kind >/dev/null 2>&1 || { echo "Kind is not installed."; exit 1; }
+	@TEST_CATEGORY=router ./test/e2e/setup.sh
+	@KUBECONFIG=/tmp/kubeconfig-e2e go test -v -timeout=18m ./test/e2e/router
+
+.PHONY: test-e2e-gateway-api
+test-e2e-gateway-api: ## Run gateway-api e2e tests.
+	@command -v kind >/dev/null 2>&1 || { echo "Kind is not installed."; exit 1; }
+	@TEST_CATEGORY=gateway-api ./test/e2e/setup.sh
+	@KUBECONFIG=/tmp/kubeconfig-e2e go test -v -timeout=10m ./test/e2e/router/gateway-api/...
+
+.PHONY: test-e2e-gateway-inference-extension
+test-e2e-gateway-inference-extension: ## Run gateway-inference-extension e2e tests.
+	@command -v kind >/dev/null 2>&1 || { echo "Kind is not installed."; exit 1; }
+	@TEST_CATEGORY=gateway-inference-extension ./test/e2e/setup.sh
+	@KUBECONFIG=/tmp/kubeconfig-e2e go test -v -timeout=10m ./test/e2e/router/gateway-inference-extension/...
+
+.PHONY: test-e2e-cleanup
+test-e2e-cleanup: ## Clean up the Kind cluster used for E2E tests.
+	@./test/e2e/cleanup.sh
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	$(GOLANGCI_LINT) run
@@ -83,16 +137,31 @@ lint: golangci-lint ## Run golangci-lint linter
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 	$(GOLANGCI_LINT) run --fix
 
+.PHONY: lint-python
+lint-python: ## Run python linter
+	pip install ruff
+	ruff check . --config python/kthena/pyproject.toml
+
+.PHONY: fmt
+fmt: ## Run go fmt against code.
+	go fmt ./...
+
+.PHONY: vet
+vet: ## Run go vet against code.
+	go vet ./...
+
 ##@ Build
 
 .PHONY: build
 build: generate fmt vet
 	go build -o bin/kthena-router cmd/kthena-router/main.go
 	go build -o bin/kthena-controller-manager cmd/kthena-controller-manager/main.go
-	go build -o bin/minfer cli/minfer/main.go
+	go build -o bin/kthena cli/kthena/main.go
 
 IMG_CONTROLLER ?= ${HUB}/kthena-controller-manager:${TAG}
 IMG_ROUTER ?= ${HUB}/kthena-router:${TAG}
+IMG_DOWNLOADER ?= ${HUB}/downloader:${TAG}
+IMG_RUNTIME ?= ${HUB}/runtime:${TAG}
 
 .PHONY: docker-build-router
 docker-build-router: generate
@@ -101,6 +170,18 @@ docker-build-router: generate
 .PHONY: docker-build-controller
 docker-build-controller: generate
 	$(CONTAINER_TOOL) build -t ${IMG_CONTROLLER} -f docker/Dockerfile.kthena-controller-manager .
+
+.PHONY: docker-build-downloader
+docker-build-downloader: generate
+	$(CONTAINER_TOOL) build -t ${IMG_DOWNLOADER} --target downloader -f python/Dockerfile python
+
+.PHONY: docker-build-runtime
+docker-build-runtime: generate
+	$(CONTAINER_TOOL) build -t ${IMG_RUNTIME} --target runtime -f python/Dockerfile python
+
+.PHONY: docker-build-all
+docker-build-all: docker-build-router docker-build-controller docker-build-downloader docker-build-runtime## Build all images.
+	@echo "All images built."
 
 .PHONY: docker-push
 docker-push: docker-build-router docker-build-controller ## Push all images to the registry.
@@ -140,11 +221,13 @@ $(LOCALBIN):
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
+HELM_DOCS ?= $(LOCALBIN)/helm-docs
 
 ## Tool Versions
 CONTROLLER_TOOLS_VERSION ?= v0.17.2
 GOLANGCI_LINT_VERSION ?= v1.64.8
 CRD_REF_DOCS_VERSION ?= v0.2.0
+HELM_DOCS_VERSION ?= v1.14.2
 
 
 
@@ -163,10 +246,36 @@ crd-ref-docs: $(CRD_REF_DOCS) ## Download crd-ref-docs locally if necessary.
 $(CRD_REF_DOCS): $(LOCALBIN)
 	$(call go-install-tool,$(CRD_REF_DOCS),github.com/elastic/crd-ref-docs,$(CRD_REF_DOCS_VERSION))
 
+.PHONY: helm-docs
+helm-docs: $(HELM_DOCS) ## Download helm-docs locally if necessary.
+$(HELM_DOCS): $(LOCALBIN)
+	$(call go-install-tool,$(HELM_DOCS),github.com/norwoodj/helm-docs/cmd/helm-docs,$(HELM_DOCS_VERSION))
+
 .PHONY: gen-copyright
 gen-copyright:
 	@echo "Adding copyright headers..."
 	@hack/update-copyright.sh
+
+mod-download-go:
+	@-GOFLAGS="-mod=readonly" find -name go.mod -execdir go mod download \;
+# go mod tidy is needed with Golang 1.16+ as go mod download affects go.sum
+# https://github.com/golang/go/issues/43994
+# exclude docs folder
+	@find . -path ./docs -prune -o -name go.mod -execdir go mod tidy \;
+
+.PHONY: mirror-licenses
+mirror-licenses: mod-download-go; \
+	go install istio.io/tools/cmd/license-lint@v0.0.0-20240221165422-57f6bfb4cd73;  \
+	rm -fr licenses; \
+	license-lint --mirror
+
+.PHONY: lint-licenses
+lint-licenses:
+	@if test -d licenses; then license-lint --config config/licenses-lint.yaml; fi
+
+.PHONY: licenses-check
+licenses-check: mirror-licenses; \
+    hack/licenses-check.sh
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary

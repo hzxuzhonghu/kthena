@@ -17,29 +17,121 @@ limitations under the License.
 package datastore
 
 import (
+	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/agiledragon/gomonkey/v2"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
-	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
-	"github.com/volcano-sh/kthena/pkg/kthena-router/backend"
-	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
 
 // ptr is a helper function to get pointer to a value
 func ptr[T any](v T) *T {
 	return &v
+}
+
+func TestParseMetricsScrapeInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		envValue string
+		expected time.Duration
+	}{
+		{
+			name:     "default when env empty",
+			envValue: "",
+			expected: defaultMetricsScrapeInterval,
+		},
+		{
+			name:     "valid duration 200ms",
+			envValue: "200ms",
+			expected: 200 * time.Millisecond,
+		},
+		{
+			name:     "valid duration 500ms",
+			envValue: "500ms",
+			expected: 500 * time.Millisecond,
+		},
+		{
+			name:     "valid duration 5s",
+			envValue: "5s",
+			expected: 5 * time.Second,
+		},
+		{
+			name:     "invalid duration falls back to default",
+			envValue: "notaduration",
+			expected: defaultMetricsScrapeInterval,
+		},
+		{
+			name:     "zero duration falls back to default",
+			envValue: "0s",
+			expected: defaultMetricsScrapeInterval,
+		},
+		{
+			name:     "negative duration falls back to default",
+			envValue: "-1s",
+			expected: defaultMetricsScrapeInterval,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("METRICS_SCRAPE_INTERVAL", tc.envValue)
+			got := parseMetricsScrapeInterval()
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+}
+
+func TestNewStoreUsesMetricsScrapeInterval(t *testing.T) {
+	t.Setenv("METRICS_SCRAPE_INTERVAL", "2s")
+	s := New().(*store)
+	assert.Equal(t, 2*time.Second, s.metricsScrapeInterval)
+}
+
+func TestNewStoreUsesDefaultMetricsScrapeInterval(t *testing.T) {
+	t.Setenv("METRICS_SCRAPE_INTERVAL", "")
+	s := New().(*store)
+	assert.Equal(t, defaultMetricsScrapeInterval, s.metricsScrapeInterval)
+}
+
+func TestCreateFairnessQueueConfig_RejectsInvalidWeights(t *testing.T) {
+	t.Setenv("FAIRNESS_PRIORITY_TOKEN_WEIGHT", "NaN")
+	t.Setenv("FAIRNESS_PRIORITY_REQUEST_NUM_WEIGHT", strconv.FormatFloat(math.Inf(1), 'f', -1, 64))
+
+	cfg := createFairnessQueueConfig()
+	defaultCfg := DefaultFairnessQueueConfig()
+
+	if cfg.TokenWeight != defaultCfg.TokenWeight {
+		t.Fatalf("Expected default token weight %v, got %v", defaultCfg.TokenWeight, cfg.TokenWeight)
+	}
+	if cfg.RequestNumWeight != defaultCfg.RequestNumWeight {
+		t.Fatalf("Expected default request weight %v, got %v", defaultCfg.RequestNumWeight, cfg.RequestNumWeight)
+	}
+
+	t.Setenv("FAIRNESS_PRIORITY_TOKEN_WEIGHT", "-1")
+	t.Setenv("FAIRNESS_PRIORITY_REQUEST_NUM_WEIGHT", "-2")
+	cfg = createFairnessQueueConfig()
+	if cfg.TokenWeight != defaultCfg.TokenWeight {
+		t.Fatalf("Expected default token weight for negative alpha, got %v", cfg.TokenWeight)
+	}
+	if cfg.RequestNumWeight != defaultCfg.RequestNumWeight {
+		t.Fatalf("Expected default request weight for negative beta, got %v", cfg.RequestNumWeight)
+	}
 }
 
 func Test_updateHistogramMetrics(t *testing.T) {
@@ -144,6 +236,11 @@ func TestStoreUpdatePodMetrics(t *testing.T) {
 	sum2 := float64(2)
 	count2 := uint64(2)
 	podinfo := PodInfo{
+		Pod: &corev1.Pod{
+			Status: corev1.PodStatus{
+				PodIP: "10.0.0.1",
+			},
+		},
 		engine: "vLLM",
 		TimePerOutputToken: &dto.Histogram{
 			SampleSum:   &sum1,
@@ -166,6 +263,26 @@ func TestStoreUpdatePodMetrics(t *testing.T) {
 	s := &store{
 		pods:        sync.Map{},
 		modelServer: sync.Map{},
+		podRuntimeInspector: &fakePodRuntimeInspector{
+			metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+				return map[string]float64{
+						utils.KVCacheUsage:      0.8,
+						utils.RequestWaitingNum: 15,
+						utils.RequestRunningNum: 10,
+						utils.TPOT:              120,
+						utils.TTFT:              210,
+					}, map[string]*dto.Histogram{
+						utils.TPOT: {
+							SampleSum:   &sum2,
+							SampleCount: &count2,
+						},
+						utils.TTFT: {
+							SampleSum:   &sum2,
+							SampleCount: &count2,
+						},
+					}
+			},
+		},
 	}
 
 	podName := types.NamespacedName{
@@ -181,27 +298,6 @@ func TestStoreUpdatePodMetrics(t *testing.T) {
 	s.modelServer.Store(modelServerName, &modelServer{
 		pods: sets.New[types.NamespacedName](podName),
 	})
-
-	patch := gomonkey.NewPatches()
-	patch.ApplyFunc(backend.GetPodMetrics, func(backend string, pod *corev1.Pod, previousHistogram map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
-		return map[string]float64{
-				utils.GPUCacheUsage:     0.8,
-				utils.RequestWaitingNum: 15,
-				utils.RequestRunningNum: 10,
-				utils.TPOT:              120,
-				utils.TTFT:              210,
-			}, map[string]*dto.Histogram{
-				utils.TPOT: {
-					SampleSum:   &sum2,
-					SampleCount: &count2,
-				},
-				utils.TTFT: {
-					SampleSum:   &sum2,
-					SampleCount: &count2,
-				},
-			}
-	})
-	defer patch.Reset()
 
 	s.updatePodMetrics(&podinfo)
 
@@ -466,8 +562,8 @@ func TestStoreDeleteModelRoute(t *testing.T) {
 	t.Run("delete route with model name", func(t *testing.T) {
 		s := &store{
 			routeInfo:           make(map[string]*modelRouteInfo),
-			routes:              make(map[string]*aiv1alpha1.ModelRoute),
-			loraRoutes:          make(map[string]*aiv1alpha1.ModelRoute),
+			routes:              make(map[string][]*aiv1alpha1.ModelRoute),
+			loraRoutes:          make(map[string][]*aiv1alpha1.ModelRoute),
 			callbacks:           make(map[string][]CallbackFunc),
 			requestWaitingQueue: sync.Map{},
 		}
@@ -505,9 +601,9 @@ func TestStoreDeleteModelRoute(t *testing.T) {
 		// Verify state
 		s.routeMutex.RLock()
 		assert.Nil(t, s.routeInfo["default/test-route"])
-		assert.Nil(t, s.routes["test-model"])
-		assert.Nil(t, s.loraRoutes["lora1"])
-		assert.Nil(t, s.loraRoutes["lora2"])
+		assert.Empty(t, s.routes["test-model"])
+		assert.Empty(t, s.loraRoutes["lora1"])
+		assert.Empty(t, s.loraRoutes["lora2"])
 		s.routeMutex.RUnlock()
 
 		// Verify queue is deleted
@@ -523,8 +619,8 @@ func TestStoreDeleteModelRoute(t *testing.T) {
 	t.Run("delete route with only lora adapters", func(t *testing.T) {
 		s := &store{
 			routeInfo:           make(map[string]*modelRouteInfo),
-			routes:              make(map[string]*aiv1alpha1.ModelRoute),
-			loraRoutes:          make(map[string]*aiv1alpha1.ModelRoute),
+			routes:              make(map[string][]*aiv1alpha1.ModelRoute),
+			loraRoutes:          make(map[string][]*aiv1alpha1.ModelRoute),
 			callbacks:           make(map[string][]CallbackFunc),
 			requestWaitingQueue: sync.Map{},
 		}
@@ -551,16 +647,16 @@ func TestStoreDeleteModelRoute(t *testing.T) {
 		// Verify state
 		s.routeMutex.RLock()
 		assert.Nil(t, s.routeInfo["test-ns/lora-route"])
-		assert.Nil(t, s.loraRoutes["lora3"])
-		assert.Nil(t, s.loraRoutes["lora4"])
+		assert.Empty(t, s.loraRoutes["lora3"])
+		assert.Empty(t, s.loraRoutes["lora4"])
 		s.routeMutex.RUnlock()
 	})
 
 	t.Run("delete non-existent route", func(t *testing.T) {
 		s := &store{
 			routeInfo:           make(map[string]*modelRouteInfo),
-			routes:              make(map[string]*aiv1alpha1.ModelRoute),
-			loraRoutes:          make(map[string]*aiv1alpha1.ModelRoute),
+			routes:              make(map[string][]*aiv1alpha1.ModelRoute),
+			loraRoutes:          make(map[string][]*aiv1alpha1.ModelRoute),
 			callbacks:           make(map[string][]CallbackFunc),
 			requestWaitingQueue: sync.Map{},
 		}
@@ -586,8 +682,8 @@ func TestStoreDeleteModelRoute(t *testing.T) {
 	t.Run("delete route while preserving others", func(t *testing.T) {
 		s := &store{
 			routeInfo:           make(map[string]*modelRouteInfo),
-			routes:              make(map[string]*aiv1alpha1.ModelRoute),
-			loraRoutes:          make(map[string]*aiv1alpha1.ModelRoute),
+			routes:              make(map[string][]*aiv1alpha1.ModelRoute),
+			loraRoutes:          make(map[string][]*aiv1alpha1.ModelRoute),
 			callbacks:           make(map[string][]CallbackFunc),
 			requestWaitingQueue: sync.Map{},
 		}
@@ -630,10 +726,10 @@ func TestStoreDeleteModelRoute(t *testing.T) {
 		s.routeMutex.RLock()
 		assert.Nil(t, s.routeInfo["default/route1"])
 		assert.NotNil(t, s.routeInfo["default/route2"])
-		assert.Nil(t, s.routes["model1"])
-		assert.NotNil(t, s.routes["model2"])
-		assert.Nil(t, s.loraRoutes["lora1"])
-		assert.NotNil(t, s.loraRoutes["lora2"])
+		assert.Empty(t, s.routes["model1"])
+		assert.NotEmpty(t, s.routes["model2"])
+		assert.Empty(t, s.loraRoutes["lora1"])
+		assert.NotEmpty(t, s.loraRoutes["lora2"])
 		s.routeMutex.RUnlock()
 
 		// Check queues
@@ -648,8 +744,8 @@ func TestStoreDeleteModelRoute(t *testing.T) {
 func TestStoreDeleteModelRoute_RequestQueueCleanup(t *testing.T) {
 	s := &store{
 		routeInfo:           make(map[string]*modelRouteInfo),
-		routes:              make(map[string]*aiv1alpha1.ModelRoute),
-		loraRoutes:          make(map[string]*aiv1alpha1.ModelRoute),
+		routes:              make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:          make(map[string][]*aiv1alpha1.ModelRoute),
 		callbacks:           make(map[string][]CallbackFunc),
 		requestWaitingQueue: sync.Map{},
 	}
@@ -687,12 +783,56 @@ func TestStoreDeleteModelRoute_RequestQueueCleanup(t *testing.T) {
 	assert.False(t, exists)
 }
 
+// TestStoreDeleteModelRoute_LoraQueueCleanup verifies that when a ModelRoute with lora adapters is deleted,
+// waiting queues for both the base model and all lora names are cleaned up (ratelimit/fairness per-model resources).
+func TestStoreDeleteModelRoute_LoraQueueCleanup(t *testing.T) {
+	s := &store{
+		routeInfo:           make(map[string]*modelRouteInfo),
+		routes:              make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:          make(map[string][]*aiv1alpha1.ModelRoute),
+		callbacks:           make(map[string][]CallbackFunc),
+		requestWaitingQueue: sync.Map{},
+	}
+
+	// Create a model route with base model and lora adapters
+	mr := &aiv1alpha1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "lora-cleanup-test",
+		},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName:    "base-model",
+			LoraAdapters: []string{"lora-a", "lora-b"},
+		},
+	}
+
+	err := s.AddOrUpdateModelRoute(mr)
+	assert.NoError(t, err)
+
+	// Create waiting queues for base model and loras (as used by fairness/ratelimit per-model)
+	s.requestWaitingQueue.Store("base-model", NewRequestPriorityQueue(nil))
+	s.requestWaitingQueue.Store("lora-a", NewRequestPriorityQueue(nil))
+	s.requestWaitingQueue.Store("lora-b", NewRequestPriorityQueue(nil))
+
+	// Delete the model route
+	err = s.DeleteModelRoute("default/lora-cleanup-test")
+	assert.NoError(t, err)
+
+	// Verify all related queues are deleted (base model + lora adapters)
+	_, existsBase := s.requestWaitingQueue.Load("base-model")
+	_, existsLoraA := s.requestWaitingQueue.Load("lora-a")
+	_, existsLoraB := s.requestWaitingQueue.Load("lora-b")
+	assert.False(t, existsBase, "waiting queue for base model should be cleaned up")
+	assert.False(t, existsLoraA, "waiting queue for lora-a should be cleaned up")
+	assert.False(t, existsLoraB, "waiting queue for lora-b should be cleaned up")
+}
+
 // TestStoreDeleteModelRoute_ConcurrentAccess tests thread safety of DeleteModelRoute
 func TestStoreDeleteModelRoute_ConcurrentAccess(t *testing.T) {
 	s := &store{
 		routeInfo:           make(map[string]*modelRouteInfo),
-		routes:              make(map[string]*aiv1alpha1.ModelRoute),
-		loraRoutes:          make(map[string]*aiv1alpha1.ModelRoute),
+		routes:              make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:          make(map[string][]*aiv1alpha1.ModelRoute),
 		callbacks:           make(map[string][]CallbackFunc),
 		requestWaitingQueue: sync.Map{},
 	}
@@ -832,8 +972,8 @@ func TestStoreMatchModelServer(t *testing.T) {
 			setupStore: func() *store {
 				s := &store{
 					routeInfo:  make(map[string]*modelRouteInfo),
-					routes:     make(map[string]*aiv1alpha1.ModelRoute),
-					loraRoutes: make(map[string]*aiv1alpha1.ModelRoute),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
 				}
 
 				// Create a ModelRoute with base model and LoRA adapters
@@ -872,8 +1012,8 @@ func TestStoreMatchModelServer(t *testing.T) {
 			setupStore: func() *store {
 				s := &store{
 					routeInfo:  make(map[string]*modelRouteInfo),
-					routes:     make(map[string]*aiv1alpha1.ModelRoute),
-					loraRoutes: make(map[string]*aiv1alpha1.ModelRoute),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
 				}
 
 				mr := &aiv1alpha1.ModelRoute{
@@ -911,8 +1051,8 @@ func TestStoreMatchModelServer(t *testing.T) {
 			setupStore: func() *store {
 				s := &store{
 					routeInfo:  make(map[string]*modelRouteInfo),
-					routes:     make(map[string]*aiv1alpha1.ModelRoute),
-					loraRoutes: make(map[string]*aiv1alpha1.ModelRoute),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
 				}
 
 				mr := &aiv1alpha1.ModelRoute{
@@ -971,8 +1111,8 @@ func TestStoreMatchModelServer(t *testing.T) {
 			setupStore: func() *store {
 				s := &store{
 					routeInfo:  make(map[string]*modelRouteInfo),
-					routes:     make(map[string]*aiv1alpha1.ModelRoute),
-					loraRoutes: make(map[string]*aiv1alpha1.ModelRoute),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
 				}
 				s.AddOrUpdateModelRoute(createComplexModelRoute())
 				return s
@@ -988,8 +1128,8 @@ func TestStoreMatchModelServer(t *testing.T) {
 			setupStore: func() *store {
 				s := &store{
 					routeInfo:  make(map[string]*modelRouteInfo),
-					routes:     make(map[string]*aiv1alpha1.ModelRoute),
-					loraRoutes: make(map[string]*aiv1alpha1.ModelRoute),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
 				}
 				s.AddOrUpdateModelRoute(createComplexModelRoute())
 				return s
@@ -1005,8 +1145,8 @@ func TestStoreMatchModelServer(t *testing.T) {
 			setupStore: func() *store {
 				s := &store{
 					routeInfo:  make(map[string]*modelRouteInfo),
-					routes:     make(map[string]*aiv1alpha1.ModelRoute),
-					loraRoutes: make(map[string]*aiv1alpha1.ModelRoute),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
 				}
 				s.AddOrUpdateModelRoute(createComplexModelRoute())
 				return s
@@ -1022,8 +1162,8 @@ func TestStoreMatchModelServer(t *testing.T) {
 			setupStore: func() *store {
 				s := &store{
 					routeInfo:  make(map[string]*modelRouteInfo),
-					routes:     make(map[string]*aiv1alpha1.ModelRoute),
-					loraRoutes: make(map[string]*aiv1alpha1.ModelRoute),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
 				}
 				s.AddOrUpdateModelRoute(createComplexModelRoute())
 				return s
@@ -1039,8 +1179,8 @@ func TestStoreMatchModelServer(t *testing.T) {
 			setupStore: func() *store {
 				s := &store{
 					routeInfo:  make(map[string]*modelRouteInfo),
-					routes:     make(map[string]*aiv1alpha1.ModelRoute),
-					loraRoutes: make(map[string]*aiv1alpha1.ModelRoute),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
 				}
 
 				mr := &aiv1alpha1.ModelRoute{
@@ -1089,8 +1229,8 @@ func TestStoreMatchModelServer(t *testing.T) {
 			setupStore: func() *store {
 				s := &store{
 					routeInfo:  make(map[string]*modelRouteInfo),
-					routes:     make(map[string]*aiv1alpha1.ModelRoute),
-					loraRoutes: make(map[string]*aiv1alpha1.ModelRoute),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
 				}
 
 				mr := &aiv1alpha1.ModelRoute{
@@ -1139,8 +1279,8 @@ func TestStoreMatchModelServer(t *testing.T) {
 			setupStore: func() *store {
 				s := &store{
 					routeInfo:  make(map[string]*modelRouteInfo),
-					routes:     make(map[string]*aiv1alpha1.ModelRoute),
-					loraRoutes: make(map[string]*aiv1alpha1.ModelRoute),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
 				}
 
 				mr := &aiv1alpha1.ModelRoute{
@@ -1185,12 +1325,191 @@ func TestStoreMatchModelServer(t *testing.T) {
 			expectedError:  false,
 		},
 		{
+			name: "duplicate model route - prefer prebuilt (oldest) ModelRoute",
+			setupStore: func() *store {
+				s := &store{
+					routeInfo:  make(map[string]*modelRouteInfo),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
+				}
+				// Prebuilt route (older CreationTimestamp)
+				prebuilt := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "prebuilt-route",
+						CreationTimestamp: metav1.NewTime(time.Now().Add(-1 * time.Hour)),
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{
+										ModelServerName: "prebuilt-server",
+										Weight:          ptr(uint32(100)),
+									},
+								},
+							},
+						},
+					},
+				}
+				// Newer duplicate route (newer CreationTimestamp) - should be ignored in favor of prebuilt
+				newer := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "newer-route",
+						CreationTimestamp: metav1.NewTime(time.Now()),
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{
+										ModelServerName: "newer-server",
+										Weight:          ptr(uint32(100)),
+									},
+								},
+							},
+						},
+					},
+				}
+				// Add newer first then prebuilt to verify sort order (CreationTimestamp) wins over add order
+				s.AddOrUpdateModelRoute(newer)
+				s.AddOrUpdateModelRoute(prebuilt)
+				return s
+			},
+			modelName:      "llama2-7b",
+			request:        &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedServer: types.NamespacedName{Namespace: "default", Name: "prebuilt-server"},
+			expectedIsLora: false,
+			expectedError:  false,
+		},
+		{
+			name: "duplicate model route - same CreationTimestamp, resourceVersion tie-break prefers older",
+			setupStore: func() *store {
+				s := &store{
+					routeInfo:  make(map[string]*modelRouteInfo),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
+				}
+				baseTime := time.Now()
+				// Older route (smaller resourceVersion = earlier in etcd)
+				older := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "z-older-route",
+						CreationTimestamp: metav1.NewTime(baseTime),
+						ResourceVersion:   "10",
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{ModelServerName: "older-server", Weight: ptr(uint32(100))},
+								},
+							},
+						},
+					},
+				}
+				// Newer route (larger resourceVersion, created in same second)
+				newer := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "a-newer-route",
+						CreationTimestamp: metav1.NewTime(baseTime),
+						ResourceVersion:   "11",
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{ModelServerName: "newer-server", Weight: ptr(uint32(100))},
+								},
+							},
+						},
+					},
+				}
+				// Add newer first - lexicographic name would wrongly prefer a-newer-route; resourceVersion ensures z-older-route wins
+				s.AddOrUpdateModelRoute(newer)
+				s.AddOrUpdateModelRoute(older)
+				return s
+			},
+			modelName:      "llama2-7b",
+			request:        &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedServer: types.NamespacedName{Namespace: "default", Name: "older-server"},
+			expectedIsLora: false,
+			expectedError:  false,
+		},
+		{
+			name: "duplicate model route - newer takes over after prebuilt deleted",
+			setupStore: func() *store {
+				s := &store{
+					routeInfo:  make(map[string]*modelRouteInfo),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
+				}
+				prebuilt := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "prebuilt-route",
+						CreationTimestamp: metav1.NewTime(time.Now().Add(-1 * time.Hour)),
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{ModelServerName: "prebuilt-server", Weight: ptr(uint32(100))},
+								},
+							},
+						},
+					},
+				}
+				newer := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "newer-route",
+						CreationTimestamp: metav1.NewTime(time.Now()),
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{ModelServerName: "newer-server", Weight: ptr(uint32(100))},
+								},
+							},
+						},
+					},
+				}
+				s.AddOrUpdateModelRoute(prebuilt)
+				s.AddOrUpdateModelRoute(newer)
+				// Delete prebuilt - newer should take over
+				s.DeleteModelRoute("default/prebuilt-route")
+				return s
+			},
+			modelName:      "llama2-7b",
+			request:        &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedServer: types.NamespacedName{Namespace: "default", Name: "newer-server"},
+			expectedIsLora: false,
+			expectedError:  false,
+		},
+		{
 			name: "no matching route",
 			setupStore: func() *store {
 				return &store{
 					routeInfo:  make(map[string]*modelRouteInfo),
-					routes:     make(map[string]*aiv1alpha1.ModelRoute),
-					loraRoutes: make(map[string]*aiv1alpha1.ModelRoute),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
 				}
 			},
 			modelName:      "non-existent-model",
@@ -1204,7 +1523,7 @@ func TestStoreMatchModelServer(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := tt.setupStore()
-			server, isLora, _, err := s.MatchModelServer(tt.modelName, tt.request)
+			server, isLora, _, err := s.MatchModelServer(tt.modelName, tt.request, "")
 
 			if tt.expectedError {
 				assert.Error(t, err)
@@ -1216,4 +1535,825 @@ func TestStoreMatchModelServer(t *testing.T) {
 			assert.Equal(t, tt.expectedServer, server)
 		})
 	}
+}
+
+type fakePodRuntimeInspector struct {
+	metricsFn    func(string, *corev1.Pod, uint32, map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram)
+	modelsFn     func(string, *corev1.Pod, uint32) ([]string, error)
+	metricsCalls atomic.Int64
+	modelsCalls  atomic.Int64
+}
+
+func (f *fakePodRuntimeInspector) GetPodMetrics(engine string, pod *corev1.Pod, port uint32, previousHistogram map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+	f.metricsCalls.Add(1)
+	if f.metricsFn == nil {
+		return nil, nil
+	}
+	return f.metricsFn(engine, pod, port, previousHistogram)
+}
+
+func (f *fakePodRuntimeInspector) GetPodModels(engine string, pod *corev1.Pod, port uint32) ([]string, error) {
+	f.modelsCalls.Add(1)
+	if f.modelsFn == nil {
+		return nil, nil
+	}
+	return f.modelsFn(engine, pod, port)
+}
+
+func newStore(inspector ...PodRuntimeInspector) *store {
+	if len(inspector) == 0 || inspector[0] == nil {
+		return New().(*store)
+	}
+	return New(WithPodRuntimeInspector(inspector[0])).(*store)
+}
+
+func TestAddOrUpdateHTTPRoute_UpdatesGatewayRoutes(t *testing.T) {
+	s := newStore()
+
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Name: "gateway-a"}},
+			},
+		},
+	}
+	assert.NoError(t, s.AddOrUpdateHTTPRoute(route))
+
+	route = route.DeepCopy()
+	route.Spec.ParentRefs = []gatewayv1.ParentReference{{Name: "gateway-b"}}
+	assert.NoError(t, s.AddOrUpdateHTTPRoute(route))
+
+	assert.Empty(t, s.GetHTTPRoutesByGateway("default/gateway-a"))
+	assert.Len(t, s.GetHTTPRoutesByGateway("default/gateway-b"), 1)
+}
+
+func TestAddOrUpdatePod_MetricsPreservedOnUpdate(t *testing.T) {
+	sampleCount := uint64(100)
+	sampleSum := 0.42
+	stubHistogram := &dto.Histogram{
+		SampleCount: &sampleCount,
+		SampleSum:   &sampleSum,
+	}
+
+	tests := []struct {
+		name            string
+		initialMetrics  map[string]float64
+		initialHist     map[string]*dto.Histogram
+		initialModels   []string
+		updatedLabels   map[string]string
+		wantGPUCache    float64
+		wantWaiting     float64
+		wantRunning     float64
+		wantTPOT        float64
+		wantTTFT        float64
+		wantModels      []string
+		wantHistPresent bool
+	}{
+		{
+			name: "pod label update preserves all gauge metrics",
+			initialMetrics: map[string]float64{
+				utils.KVCacheUsage:      0.75,
+				utils.RequestWaitingNum: 8,
+				utils.RequestRunningNum: 12,
+				utils.TPOT:              0.03,
+				utils.TTFT:              0.15,
+			},
+			initialHist:     map[string]*dto.Histogram{},
+			initialModels:   []string{"llama-3"},
+			updatedLabels:   map[string]string{"version": "v2"},
+			wantGPUCache:    0.75,
+			wantWaiting:     8,
+			wantRunning:     12,
+			wantTPOT:        0.03,
+			wantTTFT:        0.15,
+			wantModels:      []string{"llama-3"},
+			wantHistPresent: false,
+		},
+		{
+			name: "pod update preserves histogram metrics",
+			initialMetrics: map[string]float64{
+				utils.KVCacheUsage:      0.5,
+				utils.RequestWaitingNum: 3,
+				utils.RequestRunningNum: 7,
+				utils.TPOT:              0.02,
+				utils.TTFT:              0.1,
+			},
+			initialHist: map[string]*dto.Histogram{
+				utils.TPOT: stubHistogram,
+				utils.TTFT: stubHistogram,
+			},
+			initialModels:   []string{"mistral-7b", "lora-adapter-1"},
+			updatedLabels:   map[string]string{},
+			wantGPUCache:    0.5,
+			wantWaiting:     3,
+			wantRunning:     7,
+			wantTPOT:        0.02,
+			wantTTFT:        0.1,
+			wantModels:      []string{"mistral-7b", "lora-adapter-1"},
+			wantHistPresent: true,
+		},
+		{
+			name: "pod update with zero initial metrics preserves zeros",
+			initialMetrics: map[string]float64{
+				utils.KVCacheUsage:      0,
+				utils.RequestWaitingNum: 0,
+				utils.RequestRunningNum: 0,
+			},
+			initialHist:     map[string]*dto.Histogram{},
+			initialModels:   []string{},
+			updatedLabels:   map[string]string{"canary": "true"},
+			wantGPUCache:    0,
+			wantWaiting:     0,
+			wantRunning:     0,
+			wantTPOT:        0,
+			wantTTFT:        0,
+			wantModels:      []string{},
+			wantHistPresent: false,
+		},
+		{
+			name: "pod update with high load preserves high metrics",
+			initialMetrics: map[string]float64{
+				utils.KVCacheUsage:      0.99,
+				utils.RequestWaitingNum: 50,
+				utils.RequestRunningNum: 100,
+				utils.TPOT:              0.08,
+				utils.TTFT:              0.5,
+			},
+			initialHist:     map[string]*dto.Histogram{},
+			initialModels:   []string{"gpt-j"},
+			updatedLabels:   map[string]string{"zone": "us-east-1"},
+			wantGPUCache:    0.99,
+			wantWaiting:     50,
+			wantRunning:     100,
+			wantTPOT:        0.08,
+			wantTTFT:        0.5,
+			wantModels:      []string{"gpt-j"},
+			wantHistPresent: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			inspector := &fakePodRuntimeInspector{
+				metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+					return tc.initialMetrics, tc.initialHist
+				},
+				modelsFn: func(_ string, _ *corev1.Pod, _ uint32) ([]string, error) {
+					return tc.initialModels, nil
+				},
+			}
+			s := newStore(inspector)
+
+			ms := createTestModelServer("default", "ms1", aiv1alpha1.VLLM)
+			ms.Spec.WorkloadPort.Port = 8000
+			s.AddOrUpdateModelServer(ms, sets.New[types.NamespacedName]())
+
+			pod := createTestPod("default", "pod1")
+			pod.Status.PodIP = "10.0.0.1"
+			if pod.Annotations == nil {
+				pod.Annotations = make(map[string]string)
+			}
+			pod.Annotations["kthena.io/engine"] = "vLLM"
+			err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms})
+			assert.NoError(t, err)
+			assert.Equal(t, int64(1), inspector.metricsCalls.Load(), "backend metrics should be fetched on initial pod add")
+			assert.Equal(t, int64(1), inspector.modelsCalls.Load(), "backend models should be fetched on initial pod add")
+			inspector.metricsCalls.Store(0)
+			inspector.modelsCalls.Store(0)
+
+			// Simulate a pod update (e.g. label change)
+			updatedPod := pod.DeepCopy()
+			if tc.updatedLabels != nil {
+				updatedPod.Labels = tc.updatedLabels
+			}
+
+			err = s.AddOrUpdatePod(updatedPod, []*aiv1alpha1.ModelServer{ms})
+			assert.NoError(t, err)
+			assert.Equal(t, int64(0), inspector.metricsCalls.Load(), "backend.GetPodMetrics must not be called on pod update")
+			assert.Equal(t, int64(0), inspector.modelsCalls.Load(), "backend.GetPodModels must not be called on pod update")
+
+			podInfo := s.GetPodInfo(utils.GetNamespaceName(updatedPod))
+			assert.NotNil(t, podInfo)
+
+			assert.InDelta(t, tc.wantGPUCache, podInfo.GetGPUCacheUsage(), 1e-9,
+				"GPUCacheUsage dropped after pod update")
+			assert.InDelta(t, tc.wantWaiting, podInfo.GetRequestWaitingNum(), 1e-9,
+				"RequestWaitingNum dropped after pod update")
+			assert.InDelta(t, tc.wantRunning, podInfo.GetRequestRunningNum(), 1e-9,
+				"RequestRunningNum dropped after pod update")
+			assert.InDelta(t, tc.wantTPOT, podInfo.GetTPOT(), 1e-9,
+				"TPOT dropped after pod update")
+			assert.InDelta(t, tc.wantTTFT, podInfo.GetTTFT(), 1e-9,
+				"TTFT dropped after pod update")
+
+			models := podInfo.GetModels()
+			for _, m := range tc.wantModels {
+				assert.True(t, models.Contains(m), "model %s lost after pod update", m)
+			}
+			assert.Equal(t, len(tc.wantModels), models.Len(),
+				"model count changed after pod update")
+
+			if tc.wantHistPresent {
+				podInfo.mutex.RLock()
+				assert.NotNil(t, podInfo.TimePerOutputToken, "TPOT histogram lost after pod update")
+				assert.NotNil(t, podInfo.TimeToFirstToken, "TTFT histogram lost after pod update")
+				podInfo.mutex.RUnlock()
+			}
+		})
+	}
+}
+
+func TestAddOrUpdatePod_NewPodStillFetchesMetrics(t *testing.T) {
+	inspector := &fakePodRuntimeInspector{
+		metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+			return map[string]float64{
+				utils.KVCacheUsage:      0.3,
+				utils.RequestRunningNum: 2,
+			}, map[string]*dto.Histogram{}
+		},
+		modelsFn: func(_ string, _ *corev1.Pod, _ uint32) ([]string, error) {
+			return []string{"base-model"}, nil
+		},
+	}
+	s := newStore(inspector)
+
+	ms := createTestModelServer("default", "ms1", aiv1alpha1.VLLM)
+	ms.Spec.WorkloadPort.Port = 8000
+	s.AddOrUpdateModelServer(ms, sets.New[types.NamespacedName]())
+
+	pod := createTestPod("default", "fresh-pod")
+	pod.Status.PodIP = "10.0.0.1"
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations["kthena.io/engine"] = "vLLM"
+	err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms})
+	assert.NoError(t, err)
+
+	assert.Equal(t, int64(1), inspector.metricsCalls.Load(), "backend.GetPodMetrics must be called for new pods")
+	assert.Equal(t, int64(1), inspector.modelsCalls.Load(), "backend.GetPodModels must be called for new pods")
+
+	podInfo := s.GetPodInfo(utils.GetNamespaceName(pod))
+	assert.InDelta(t, 0.3, podInfo.GetGPUCacheUsage(), 1e-9)
+	assert.InDelta(t, 2.0, podInfo.GetRequestRunningNum(), 1e-9)
+}
+
+func TestAddOrUpdatePod_ModelServerChangePreservesMetrics(t *testing.T) {
+	inspector := &fakePodRuntimeInspector{
+		metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+			return map[string]float64{
+				utils.KVCacheUsage:      0.6,
+				utils.RequestWaitingNum: 5,
+				utils.RequestRunningNum: 10,
+				utils.TPOT:              0.04,
+				utils.TTFT:              0.2,
+			}, map[string]*dto.Histogram{}
+		},
+		modelsFn: func(_ string, _ *corev1.Pod, _ uint32) ([]string, error) {
+			return []string{"model-a"}, nil
+		},
+	}
+	s := newStore(inspector)
+
+	ms1 := createTestModelServer("default", "ms1", aiv1alpha1.VLLM)
+	ms1.Spec.WorkloadPort.Port = 8000
+	ms2 := createTestModelServer("default", "ms2", aiv1alpha1.VLLM)
+	ms2.Spec.WorkloadPort.Port = 8000
+	s.AddOrUpdateModelServer(ms1, sets.New[types.NamespacedName]())
+	s.AddOrUpdateModelServer(ms2, sets.New[types.NamespacedName]())
+
+	pod := createTestPod("default", "pod1")
+	pod.Status.PodIP = "10.0.0.1"
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations["kthena.io/engine"] = "vLLM"
+	err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms1})
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), inspector.metricsCalls.Load(), "backend metrics should be fetched on initial pod add")
+	assert.Equal(t, int64(1), inspector.modelsCalls.Load(), "backend models should be fetched on initial pod add")
+	inspector.metricsCalls.Store(0)
+	inspector.modelsCalls.Store(0)
+
+	// Move pod from ms1 to ms2
+	err = s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms2})
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), inspector.metricsCalls.Load(), "backend.GetPodMetrics must not be called on pod update")
+	assert.Equal(t, int64(0), inspector.modelsCalls.Load(), "backend.GetPodModels must not be called on pod update")
+
+	podInfo := s.GetPodInfo(utils.GetNamespaceName(pod))
+	assert.InDelta(t, 0.6, podInfo.GetGPUCacheUsage(), 1e-9,
+		"GPUCacheUsage lost during model server reassignment")
+	assert.InDelta(t, 5.0, podInfo.GetRequestWaitingNum(), 1e-9,
+		"RequestWaitingNum lost during model server reassignment")
+	assert.InDelta(t, 10.0, podInfo.GetRequestRunningNum(), 1e-9,
+		"RequestRunningNum lost during model server reassignment")
+	assert.InDelta(t, 0.04, podInfo.GetTPOT(), 1e-9,
+		"TPOT lost during model server reassignment")
+	assert.InDelta(t, 0.2, podInfo.GetTTFT(), 1e-9,
+		"TTFT lost during model server reassignment")
+
+	models := podInfo.GetModels()
+	assert.True(t, models.Contains("model-a"), "model lost during model server reassignment")
+}
+
+func TestSelectDestination_EmptyTargets(t *testing.T) {
+	// This test verifies the fix for the panic when TargetModels is empty.
+	// Before the fix, toWeightedSlice would panic with index out of range [0] with length 0.
+	targets := []*aiv1alpha1.TargetModel{}
+	s := &store{}
+	_, err := s.selectDestination(targets)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no target models specified in rule")
+}
+
+func TestToWeightedSlice_SingleTarget(t *testing.T) {
+	weight := uint32(100)
+	targets := []*aiv1alpha1.TargetModel{
+		{ModelServerName: "server-a", Weight: &weight},
+	}
+	result, err := toWeightedSlice(targets)
+	assert.NoError(t, err)
+	assert.Equal(t, []uint32{100}, result)
+}
+
+func TestToWeightedSlice_MultipleTargets(t *testing.T) {
+	w1 := uint32(70)
+	w2 := uint32(30)
+	targets := []*aiv1alpha1.TargetModel{
+		{ModelServerName: "server-a", Weight: &w1},
+		{ModelServerName: "server-b", Weight: &w2},
+	}
+	result, err := toWeightedSlice(targets)
+	assert.NoError(t, err)
+	assert.Equal(t, []uint32{70, 30}, result)
+}
+
+func TestToWeightedSlice_NoWeights(t *testing.T) {
+	targets := []*aiv1alpha1.TargetModel{
+		{ModelServerName: "server-a"},
+		{ModelServerName: "server-b"},
+	}
+	result, err := toWeightedSlice(targets)
+	assert.NoError(t, err)
+	assert.Equal(t, []uint32{1, 1}, result)
+}
+
+func TestToWeightedSlice_MixedWeights(t *testing.T) {
+	w1 := uint32(50)
+	targets := []*aiv1alpha1.TargetModel{
+		{ModelServerName: "server-a", Weight: &w1},
+		{ModelServerName: "server-b"}, // no weight
+	}
+	_, err := toWeightedSlice(targets)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "weight field in targetModel must be either fully specified or not specified")
+}
+
+func TestSelectFromWeightedSlice_EmptyWeights(t *testing.T) {
+	_, err := selectFromWeightedSlice([]uint32{})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no weights provided")
+}
+
+func TestSelectFromWeightedSlice_ZeroTotalWeight(t *testing.T) {
+	// This test verifies the fix for the panic when all weights are zero.
+	// Before the fix, rng.Intn(0) would panic.
+	_, err := selectFromWeightedSlice([]uint32{0, 0, 0})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "total weight is zero")
+}
+
+func TestSelectFromWeightedSlice_ValidWeights(t *testing.T) {
+	// Run multiple times to verify no panics and results are within range
+	for i := 0; i < 100; i++ {
+		idx, err := selectFromWeightedSlice([]uint32{50, 30, 20})
+		assert.NoError(t, err)
+		assert.True(t, idx >= 0 && idx < 3, "index should be in range [0, 3)")
+	}
+}
+
+func TestMatchModelServer_EmptyTargetModels_NoPanic(t *testing.T) {
+	// This is the end-to-end test for the bug: a ModelRoute with a rule
+	// that has empty TargetModels should return an error, not panic.
+	s := &store{
+		routeInfo:          make(map[string]*modelRouteInfo),
+		routes:             make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:         make(map[string][]*aiv1alpha1.ModelRoute),
+		gatewayModelRoutes: make(map[string]sets.Set[string]),
+	}
+
+	mr := &aiv1alpha1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "broken-route",
+		},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "my-model",
+			Rules: []*aiv1alpha1.Rule{
+				{
+					Name:         "catch-all",
+					TargetModels: []*aiv1alpha1.TargetModel{}, // empty — the bug trigger
+				},
+			},
+		},
+	}
+	s.AddOrUpdateModelRoute(mr)
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}}
+
+	// Before the fix this would panic. After the fix it returns an error.
+	assert.NotPanics(t, func() {
+		_, _, _, err := s.MatchModelServer("my-model", req, "")
+		assert.Error(t, err)
+	})
+}
+
+func TestMatchModelServer_EmptyTargetModels_FallsThrough(t *testing.T) {
+	// When the first rule has empty TargetModels but a second rule is valid,
+	// the request should fall through to the second rule.
+	s := &store{
+		routeInfo:          make(map[string]*modelRouteInfo),
+		routes:             make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:         make(map[string][]*aiv1alpha1.ModelRoute),
+		gatewayModelRoutes: make(map[string]sets.Set[string]),
+	}
+
+	w := uint32(100)
+	mr := &aiv1alpha1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "route-with-fallback",
+		},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "my-model",
+			Rules: []*aiv1alpha1.Rule{
+				{
+					Name: "broken-rule",
+					ModelMatch: &aiv1alpha1.ModelMatch{
+						Uri: &aiv1alpha1.StringMatch{Exact: ptr("/v1/broken")},
+					},
+					TargetModels: []*aiv1alpha1.TargetModel{}, // empty
+				},
+				{
+					Name: "valid-rule",
+					TargetModels: []*aiv1alpha1.TargetModel{
+						{ModelServerName: "good-server", Weight: &w},
+					},
+				},
+			},
+		},
+	}
+	s.AddOrUpdateModelRoute(mr)
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}}
+	server, _, _, err := s.MatchModelServer("my-model", req, "")
+	assert.NoError(t, err)
+	assert.Equal(t, types.NamespacedName{Namespace: "default", Name: "good-server"}, server)
+}
+
+func TestMatchModelServer_GatewayScoped(t *testing.T) {
+	kindGateway := gatewayv1.Kind("Gateway")
+	sectionHTTPS := gatewayv1.SectionName("https")
+	sectionNonexistent := gatewayv1.SectionName("nonexistent-listener")
+
+	tests := []struct {
+		name           string
+		setupStore     func() *store
+		modelName      string
+		gatewayKey     string
+		request        *http.Request
+		expectedServer types.NamespacedName
+		expectedIsLora bool
+		expectedError  bool
+	}{
+		{
+			name: "route matches correct gateway",
+			setupStore: func() *store {
+				s := newStore()
+				s.AddOrUpdateGateway(&gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gateway"},
+					Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http"}}},
+				})
+				s.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route-a"},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName:  "llama3",
+						ParentRefs: []gatewayv1.ParentReference{{Name: "my-gateway", Kind: &kindGateway}},
+						Rules: []*aiv1alpha1.Rule{
+							{Name: "r", TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "llama3-server", Weight: ptr(uint32(100))}}},
+						},
+					},
+				})
+				return s
+			},
+			modelName:      "llama3",
+			gatewayKey:     "default/my-gateway",
+			request:        &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedServer: types.NamespacedName{Namespace: "default", Name: "llama3-server"},
+			expectedIsLora: false,
+			expectedError:  false,
+		},
+		{
+			name: "route skipped for different gateway",
+			setupStore: func() *store {
+				s := newStore()
+				s.AddOrUpdateGateway(&gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gateway-a"},
+					Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http"}}},
+				})
+				s.AddOrUpdateGateway(&gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gateway-b"},
+					Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http"}}},
+				})
+				s.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route-a"},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName:  "llama3",
+						ParentRefs: []gatewayv1.ParentReference{{Name: "gateway-a", Kind: &kindGateway}},
+						Rules: []*aiv1alpha1.Rule{
+							{Name: "r", TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "server-a", Weight: ptr(uint32(100))}}},
+						},
+					},
+				})
+				return s
+			},
+			modelName:     "llama3",
+			gatewayKey:    "default/gateway-b",
+			request:       &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedError: true,
+		},
+		{
+			name: "route without parentRefs skipped when gatewayKey is set",
+			setupStore: func() *store {
+				s := newStore()
+				s.AddOrUpdateGateway(&gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gateway"},
+					Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http"}}},
+				})
+				s.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route-a"},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama3",
+						Rules: []*aiv1alpha1.Rule{
+							{Name: "r", TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "llama3-server", Weight: ptr(uint32(100))}}},
+						},
+					},
+				})
+				return s
+			},
+			modelName:     "llama3",
+			gatewayKey:    "default/my-gateway",
+			request:       &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedError: true,
+		},
+		{
+			name: "route without parentRefs matches when gatewayKey is empty",
+			setupStore: func() *store {
+				s := newStore()
+				s.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route-a"},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama3",
+						Rules: []*aiv1alpha1.Rule{
+							{Name: "r", TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "llama3-server", Weight: ptr(uint32(100))}}},
+						},
+					},
+				})
+				return s
+			},
+			modelName:      "llama3",
+			gatewayKey:     "",
+			request:        &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedServer: types.NamespacedName{Namespace: "default", Name: "llama3-server"},
+			expectedError:  false,
+		},
+		{
+			name: "gateway not in store returns error",
+			setupStore: func() *store {
+				s := newStore()
+				s.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route-a"},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName:  "llama3",
+						ParentRefs: []gatewayv1.ParentReference{{Name: "my-gateway", Kind: &kindGateway}},
+						Rules: []*aiv1alpha1.Rule{
+							{Name: "r", TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "llama3-server", Weight: ptr(uint32(100))}}},
+						},
+					},
+				})
+				return s
+			},
+			modelName:     "llama3",
+			gatewayKey:    "default/my-gateway",
+			request:       &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedError: true,
+		},
+		{
+			name: "sectionName matches existing listener",
+			setupStore: func() *store {
+				s := newStore()
+				s.AddOrUpdateGateway(&gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gateway"},
+					Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http"}, {Name: "https"}}},
+				})
+				s.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route-a"},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName:  "llama3",
+						ParentRefs: []gatewayv1.ParentReference{{Name: "my-gateway", Kind: &kindGateway, SectionName: &sectionHTTPS}},
+						Rules: []*aiv1alpha1.Rule{
+							{Name: "r", TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "llama3-server", Weight: ptr(uint32(100))}}},
+						},
+					},
+				})
+				return s
+			},
+			modelName:      "llama3",
+			gatewayKey:     "default/my-gateway",
+			request:        &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedServer: types.NamespacedName{Namespace: "default", Name: "llama3-server"},
+			expectedError:  false,
+		},
+		{
+			name: "sectionName does not match any listener",
+			setupStore: func() *store {
+				s := newStore()
+				s.AddOrUpdateGateway(&gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gateway"},
+					Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http"}}},
+				})
+				s.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route-a"},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName:  "llama3",
+						ParentRefs: []gatewayv1.ParentReference{{Name: "my-gateway", Kind: &kindGateway, SectionName: &sectionNonexistent}},
+						Rules: []*aiv1alpha1.Rule{
+							{Name: "r", TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "llama3-server", Weight: ptr(uint32(100))}}},
+						},
+					},
+				})
+				return s
+			},
+			modelName:     "llama3",
+			gatewayKey:    "default/my-gateway",
+			request:       &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedError: true,
+		},
+		{
+			name: "lora-only route matched via gateway key",
+			setupStore: func() *store {
+				s := newStore()
+				s.AddOrUpdateGateway(&gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gateway"},
+					Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http"}}},
+				})
+				s.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "lora-route"},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						LoraAdapters: []string{"math-lora"},
+						ParentRefs:   []gatewayv1.ParentReference{{Name: "my-gateway", Kind: &kindGateway}},
+						Rules: []*aiv1alpha1.Rule{
+							{Name: "r", TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "lora-server", Weight: ptr(uint32(100))}}},
+						},
+					},
+				})
+				return s
+			},
+			modelName:      "math-lora",
+			gatewayKey:     "default/my-gateway",
+			request:        &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedServer: types.NamespacedName{Namespace: "default", Name: "lora-server"},
+			expectedIsLora: true,
+			expectedError:  false,
+		},
+		{
+			name: "multiple routes — only matching gateway selected",
+			setupStore: func() *store {
+				s := newStore()
+				s.AddOrUpdateGateway(&gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gateway-a"},
+					Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http"}}},
+				})
+				s.AddOrUpdateGateway(&gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gateway-b"},
+					Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http"}}},
+				})
+				kindA := gatewayv1.Kind("Gateway")
+				kindB := gatewayv1.Kind("Gateway")
+				s.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route-a"},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName:  "llama3",
+						ParentRefs: []gatewayv1.ParentReference{{Name: "gateway-a", Kind: &kindA}},
+						Rules: []*aiv1alpha1.Rule{
+							{Name: "r", TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "server-a", Weight: ptr(uint32(100))}}},
+						},
+					},
+				})
+				s.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route-b"},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName:  "llama3",
+						ParentRefs: []gatewayv1.ParentReference{{Name: "gateway-b", Kind: &kindB}},
+						Rules: []*aiv1alpha1.Rule{
+							{Name: "r", TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "server-b", Weight: ptr(uint32(100))}}},
+						},
+					},
+				})
+				return s
+			},
+			modelName:      "llama3",
+			gatewayKey:     "default/gateway-a",
+			request:        &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedServer: types.NamespacedName{Namespace: "default", Name: "server-a"},
+			expectedError:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := tt.setupStore()
+			server, isLora, _, err := s.MatchModelServer(tt.modelName, tt.request, tt.gatewayKey)
+
+			if tt.expectedError {
+				assert.Error(t, err)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expectedIsLora, isLora)
+			assert.Equal(t, tt.expectedServer, server)
+		})
+	}
+}
+
+func TestStoreRunBoundedConcurrency(t *testing.T) {
+	const testPodCount = 150 // > maxConcurrentPodScrapes (100)
+
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	var metricsCalls, modelsCalls atomic.Int64
+
+	s := &store{
+		pods:                  sync.Map{},
+		modelServer:           sync.Map{},
+		initialSynced:         &atomic.Bool{},
+		metricsScrapeInterval: 10 * time.Millisecond,
+		podRuntimeInspector: &fakePodRuntimeInspector{
+			metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+				current := inFlight.Add(1)
+				defer inFlight.Add(-1)
+
+				// Track max concurrent goroutines
+				for {
+					max := maxInFlight.Load()
+					if current <= max {
+						break
+					}
+					if maxInFlight.CompareAndSwap(max, current) {
+						break
+					}
+				}
+
+				// Small sleep to ensure goroutines pile up and hit the cap
+				time.Sleep(2 * time.Millisecond)
+
+				metricsCalls.Add(1)
+				return nil, nil
+			},
+			modelsFn: func(_ string, _ *corev1.Pod, _ uint32) ([]string, error) {
+				modelsCalls.Add(1)
+				return nil, nil
+			},
+		},
+	}
+
+	for i := 0; i < testPodCount; i++ {
+		podName := types.NamespacedName{Namespace: "default", Name: fmt.Sprintf("pod%d", i)}
+		s.pods.Store(podName, &PodInfo{
+			Pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: podName.Name, Namespace: podName.Namespace},
+				Status:     corev1.PodStatus{PodIP: fmt.Sprintf("10.0.0.%d", i)},
+			},
+			engine:      "vLLM",
+			modelServer: sets.New[types.NamespacedName](types.NamespacedName{Namespace: "default", Name: "model"}),
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start the actual Run loop
+	s.Run(ctx)
+
+	// Wait for at least one full cycle of scrapes
+	assert.Eventually(t, func() bool {
+		return metricsCalls.Load() >= int64(testPodCount) && modelsCalls.Load() >= int64(testPodCount)
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Verify the bound was respected and parallelism actually occurred
+	assert.Greater(t, maxInFlight.Load(), int32(1), "expected at least some parallelism in scrapes")
+	assert.LessOrEqual(t, maxInFlight.Load(), int32(maxConcurrentPodScrapes), "in-flight requests should never exceed the semaphore cap")
 }

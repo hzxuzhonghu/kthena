@@ -18,41 +18,83 @@ package app
 
 import (
 	"context"
+	"os"
+	"time"
 
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
 
+const defaultDrainTimeout = 5 * time.Minute
+
 type Server struct {
-	store       datastore.Store
-	controllers Controller
-	EnableTLS   bool
-	TLSCertFile string
-	TLSKeyFile  string
-	Port        string
+	store                              datastore.Store
+	controllers                        Controller
+	listenerManager                    *ListenerManager
+	EnableTLS                          bool
+	TLSCertFile                        string
+	TLSKeyFile                         string
+	Port                               string
+	EnableGatewayAPI                   bool
+	EnableGatewayAPIInferenceExtension bool
+	DebugPort                          int
+	KubeAPIQPS                         float32
+	KubeAPIBurst                       int
+	// drainTimeout is HTTP server shutdown grace; not datastore state.
+	drainTimeout time.Duration
 }
 
-func NewServer(port string, enableTLS bool, cert, key string) *Server {
+func NewServer(port string, enableTLS bool, cert, key string, enableGatewayAPI bool, enableGatewayAPIInferenceExtension bool, debugPort int, kubeAPIQPS float32, kubeAPIBurst int) *Server {
 	return &Server{
-		store:       nil,
-		EnableTLS:   enableTLS,
-		TLSCertFile: cert,
-		TLSKeyFile:  key,
-		Port:        port,
+		store:                              nil,
+		EnableTLS:                          enableTLS,
+		TLSCertFile:                        cert,
+		TLSKeyFile:                         key,
+		Port:                               port,
+		EnableGatewayAPI:                   enableGatewayAPI,
+		EnableGatewayAPIInferenceExtension: enableGatewayAPIInferenceExtension,
+		DebugPort:                          debugPort,
+		KubeAPIQPS:                         kubeAPIQPS,
+		KubeAPIBurst:                       kubeAPIBurst,
+		drainTimeout:                       parseDrainTimeout(),
 	}
 }
 
+func parseDrainTimeout() time.Duration {
+	if v := os.Getenv("DRAIN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+		klog.Warningf("Invalid DRAIN_TIMEOUT %q, using default %v", v, defaultDrainTimeout)
+	}
+	return defaultDrainTimeout
+}
+
 func (s *Server) Run(ctx context.Context) {
+	// Build store options. When REDIS_HOST is set, use a Redis-backed on-flight
+	// counter so that multiple router replicas share a globally consistent view
+	// of in-flight request counts, enabling better cross-router scheduling.
+	var storeOpts []datastore.Option
+	if os.Getenv("REDIS_HOST") != "" {
+		if redisClient := utils.TryGetRedisClient(); redisClient != nil {
+			klog.Infof("Redis on-flight counter enabled: cross-router in-flight tracking active")
+			storeOpts = append(storeOpts, datastore.WithRedisOnFlightCounter(datastore.NewRedisOnFlightCounter(redisClient)))
+		} else {
+			klog.Warningf("REDIS_HOST is set but Redis connection failed; falling back to local on-flight counter")
+		}
+	}
+
 	// create store
-	store := datastore.New()
+	store := datastore.New(storeOpts...)
 	s.store = store
 
 	// must be run before the controller, because it will register callbacks
 	r := NewRouter(store)
 	// start controller
-	s.controllers = startControllers(store, ctx.Done())
+	s.controllers = startControllers(store, ctx.Done(), s.EnableGatewayAPI, s.Port, s.EnableGatewayAPIInferenceExtension, s.KubeAPIQPS, s.KubeAPIBurst)
 
 	// Start store's periodic update loop after controllers have synced
 	if !cache.WaitForCacheSync(ctx.Done(), s.controllers.HasSynced) {
@@ -62,6 +104,11 @@ func (s *Server) Run(ctx context.Context) {
 	store.Run(ctx)
 	// start router
 	s.startRouter(ctx, r, store)
+
+	// Block until context is cancelled to keep the process running
+	klog.Info("Router server started, waiting for shutdown signal...")
+	<-ctx.Done()
+	klog.Info("Router server shutting down...")
 }
 
 func (s *Server) HasSynced() bool {

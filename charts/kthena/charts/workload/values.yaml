@@ -1,6 +1,11 @@
 controllerManager:
   webhook:
     enabled: true
+    tls:
+      # certSecretName is the name of the secret to store auto-generated certificates
+      certSecretName: kthena-controller-manager-webhook-certs
+      # serviceName is the service name used for certificate DNS names
+      serviceName: kthena-controller-manager-webhook
   # replicas is the number of instances to run.
   replicas: 1
   image:
@@ -17,6 +22,19 @@ controllerManager:
     requests:
       cpu: 100m
       memory: 128Mi
+  # controllers specifies which controllers to enable
+  # Available options: modelserving, modelbooster, autoscaler
+  # If empty or not specified, all controllers are enabled
+  controllers: ""
+  # kubeAPIQPS is the QPS (queries per second) to use while talking with kubernetes apiserver
+  # If 0 or not specified, uses default value (5)
+  kubeAPIQPS: 0
+  # kubeAPIBurst is the burst to use while talking with kubernetes apiserver
+  # If 0 or not specified, uses default value (10)
+  kubeAPIBurst: 0
+  # debugPort is the debug HTTP server port.
+  # If 0 or not specified, debug server is disabled.
+  debugPort: 0
   # downloaderImage is the container image used for downloading models.
   downloaderImage:
     repository: ghcr.io/volcano-sh/downloader
@@ -33,11 +51,3 @@ controllerManager:
     # secretKey is the secret key for the downloader.
     secretKey: ""
 
-global:
-  certManager:
-    enabled: true
-  webhook:
-  # caBundle is the base64-encoded CA bundle for webhook server certificates.
-  # This is required when cert-manager is disabled (global.certManager.enabled=false).
-  # You can generate it with: cat /path/to/your/ca.crt | base64 | tr -d '\n'
-  # caBundle: ""

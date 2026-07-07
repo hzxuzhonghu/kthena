@@ -1,0 +1,428 @@
+name: Build, Push, and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+      - "v*.*.*-*" # Support for pre-release tags like v1.2.3-alpha
+    paths:
+      - "charts/kthena/**"
+      - "python/**"
+      - "docker/**"
+      - "**.go"
+      - "pkg/**"
+      - "cmd/**"
+      - "go.mod"
+      - "go.sum"
+  pull_request:
+    branches:
+      - main
+      - "release-*"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      release_build: ${{ steps.filter.outputs.release_build }}
+      version: ${{ steps.version.outputs.version }}
+      is_tag: ${{ steps.version.outputs.is_tag }}
+      prerelease: ${{ steps.is_prerelease.outputs.prerelease }}
+    steps:
+      - name: Check build related changes
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            release_build:
+              - "docker/**"
+              - "python/Dockerfile"
+              - ".github/workflows/build-push-release.yml"
+
+      - name: Skip build
+        if: github.event_name == 'pull_request' && steps.filter.outputs.release_build != 'true'
+        run: echo "No release build-related files changed; marking required check as passed."
+
+      - name: Checkout
+        if: github.event_name != 'pull_request' || steps.filter.outputs.release_build == 'true'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version
+        if: github.event_name != 'pull_request' || steps.filter.outputs.release_build == 'true'
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+          else
+            VERSION="0.0.0-main-$(date -u +'%Y%m%d%H%M%S')-$(git rev-parse --short HEAD)"
+            echo "is_tag=false" >> $GITHUB_OUTPUT
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check for Prerelease
+        if: steps.version.outputs.is_tag == 'true' && (github.event_name != 'pull_request' || steps.filter.outputs.release_build == 'true')
+        id: is_prerelease
+        run: |
+          if [[ "${{ steps.version.outputs.version }}" == *-* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+  build_images:
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          # kthena-router
+          - service: kthena-router
+            context: .
+            dockerfile: ./docker/Dockerfile.kthena-router
+            os: ubuntu-latest
+            platform: linux/amd64
+          - service: kthena-router
+            context: .
+            dockerfile: ./docker/Dockerfile.kthena-router
+            os: ubuntu-24.04-arm
+            platform: linux/arm64
+          # kthena-controller-manager
+          - service: kthena-controller-manager
+            context: .
+            dockerfile: ./docker/Dockerfile.kthena-controller-manager
+            os: ubuntu-latest
+            platform: linux/amd64
+          - service: kthena-controller-manager
+            context: .
+            dockerfile: ./docker/Dockerfile.kthena-controller-manager
+            os: ubuntu-24.04-arm
+            platform: linux/arm64
+          # downloader
+          - service: downloader
+            context: ./python
+            dockerfile: ./python/Dockerfile
+            target: downloader
+            os: ubuntu-latest
+            platform: linux/amd64
+          - service: downloader
+            context: ./python
+            dockerfile: ./python/Dockerfile
+            target: downloader
+            os: ubuntu-24.04-arm
+            platform: linux/arm64
+          # runtime
+          - service: runtime
+            context: ./python
+            dockerfile: ./python/Dockerfile
+            target: runtime
+            os: ubuntu-latest
+            platform: linux/amd64
+          - service: runtime
+            context: ./python
+            dockerfile: ./python/Dockerfile
+            target: runtime
+            os: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - name: Checkout
+        if: github.event_name != 'pull_request' || needs.setup.outputs.release_build == 'true'
+        uses: actions/checkout@v5
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        if: ${{ github.event_name != 'pull_request' }}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker Image Metadata
+        if: github.event_name != 'pull_request' || needs.setup.outputs.release_build == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}
+          tags: |
+            type=raw,value=${{ needs.setup.outputs.version }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up Docker Buildx
+        if: github.event_name != 'pull_request' || needs.setup.outputs.release_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Images
+        if: github.event_name != 'pull_request' || needs.setup.outputs.release_build == 'true'
+        uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.service }},push-by-digest=${{ github.event_name != 'pull_request' }},name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+
+      - name: Export digest
+        if: ${{ github.event_name != 'pull_request' }}
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.service }}-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # merge images: Create Multi-Arch Manifests
+  merge_images:
+    needs: [setup, build_images]
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - service: kthena-router
+          - service: kthena-controller-manager
+          - service: downloader
+          - service: runtime
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.service }}-*
+          merge-multiple: true
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Image Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}
+          tags: |
+            type=raw,value=${{ needs.setup.outputs.version }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+          $(printf 'ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:${{ needs.setup.outputs.version }}
+
+  build_cli:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            goos: linux
+            goarch: amd64
+            ext: ""
+          - os: linux
+            arch: arm64
+            goos: linux
+            goarch: arm64
+            ext: ""
+          - os: darwin
+            arch: amd64
+            goos: darwin
+            goarch: amd64
+            ext: ""
+          - os: darwin
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+            ext: ""
+          - os: windows
+            arch: amd64
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+    steps:
+      - name: Checkout
+        if: github.event_name != 'pull_request' || needs.setup.outputs.release_build == 'true'
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        if: github.event_name != 'pull_request' || needs.setup.outputs.release_build == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build binary
+        if: github.event_name != 'pull_request' || needs.setup.outputs.release_build == 'true'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -o kthena${{ matrix.ext }} ./cli/kthena
+
+      - name: Package binary
+        if: github.event_name != 'pull_request' || needs.setup.outputs.release_build == 'true'
+        run: |
+          VERSION="${{ needs.setup.outputs.version }}"
+          OS="${{ matrix.os }}"
+          ARCH="${{ matrix.arch }}"
+          BINARY_NAME="kthena${{ matrix.ext }}"
+          ARCHIVE_NAME="kthena-cli-${OS}-${ARCH}"
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            zip -j "${ARCHIVE_NAME}.zip" "${BINARY_NAME}"
+            echo "archive_path=${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
+          else
+            tar -czf "${ARCHIVE_NAME}.tar.gz" "${BINARY_NAME}"
+            echo "archive_path=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Upload CLI Binary
+        if: ${{ needs.setup.outputs.is_tag == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-binaries-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ env.archive_path }}
+          retention-days: 1
+
+  push_helm_chart:
+    needs: [setup, merge_images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Setup yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Update Chart and Package
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          CHART_PATH="charts/kthena"
+          yq e -i '.version = "'$VERSION'"' $CHART_PATH/Chart.yaml
+          yq e -i '.appVersion = "'$VERSION'"' $CHART_PATH/Chart.yaml
+          yq e -i '
+            .workload.controllerManager.image.tag = "'$VERSION'" |
+            .workload.controllerManager.downloaderImage.tag = "'$VERSION'" |
+            .workload.controllerManager.runtimeImage.tag = "'$VERSION'" |
+            .networking.kthenaRouter.image.tag = "'$VERSION'"
+          ' $CHART_PATH/values.yaml
+          helm dependency build $CHART_PATH
+          helm package $CHART_PATH --version $VERSION --app-version $VERSION
+          mv kthena-${VERSION}.tgz kthena.tgz
+
+      - name: Push to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          LOWER_REPO_OWNER=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          helm push kthena.tgz oci://ghcr.io/$LOWER_REPO_OWNER/charts
+
+      - name: Prepare Helm Release Artifacts
+        if: needs.setup.outputs.is_tag == 'true'
+        run: |
+          helm template kthena ./charts/kthena --namespace kthena-system --include-crds > kthena-install.yaml
+
+      - name: Upload Helm Release Artifacts
+        if: needs.setup.outputs.is_tag == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-release-artifacts
+          path: |
+            ./kthena.tgz
+            ./kthena-install.yaml
+
+  create_github_release:
+    needs: [setup, push_helm_chart, build_cli]
+    if: needs.setup.outputs.is_tag == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Helm Release Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: helm-release-artifacts
+
+      - name: Download CLI Binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: ./cli-binaries
+          pattern: cli-binaries-*
+          merge-multiple: true
+
+      - name: Create Github Release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ needs.setup.outputs.prerelease }}
+          body: |
+            This release includes the following artifacts:
+
+            - **Helm Chart**: `kthena.tgz` (OCI artifact pushed to GHCR)
+            - **Installation YAML**: `kthena-install.yaml`
+            - **CLI Binaries**: Pre-built binaries for Linux (amd64/arm64), macOS (amd64/arm64), and Windows (amd64)
+
+            ### Documentation
+
+            - [Installation](https://kthena.volcano.sh/docs/getting-started/installation)
+            - [Quick Start](https://kthena.volcano.sh/docs/getting-started/quick-start)
+            - [Helm Chart Values](https://kthena.volcano.sh/docs/reference/helm-chart-values)
+            - [CLI Reference](https://kthena.volcano.sh/docs/reference/kthena-cli)
+
+            ---
+
+            *Release notes are automatically generated from commits.*
+          generate_release_notes: true
+          files: |
+            ./kthena.tgz
+            ./kthena-install.yaml
+            ./cli-binaries/*

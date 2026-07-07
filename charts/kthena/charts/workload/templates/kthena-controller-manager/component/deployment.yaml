@@ -23,14 +23,37 @@ spec:
           image: "{{ .Values.controllerManager.image.repository }}:{{ .Values.controllerManager.image.tag }}"
           args:
             {{- toYaml .Values.controllerManager.image.args | nindent 12 }}
+            - --cert-secret-name={{ .Values.controllerManager.webhook.tls.certSecretName }}
+            - --service-name={{ .Values.controllerManager.webhook.tls.serviceName }}
+            {{- if .Values.controllerManager.controllers }}
+            {{- if kindIs "string" .Values.controllerManager.controllers }}
+            - "--controllers={{ .Values.controllerManager.controllers }}"
+            {{- else }}
+            - "--controllers={{ join "," .Values.controllerManager.controllers }}"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.controllerManager.kubeAPIQPS }}
+            - --kube-api-qps={{ .Values.controllerManager.kubeAPIQPS }}
+            {{- end }}
+            {{- if .Values.controllerManager.kubeAPIBurst }}
+            - --kube-api-burst={{ .Values.controllerManager.kubeAPIBurst }}
+            {{- end }}
+            {{- if .Values.controllerManager.debugPort }}
+            - --debug-port={{ .Values.controllerManager.debugPort }}
+            {{- end }}
           imagePullPolicy: {{ .Values.controllerManager.image.pullPolicy }}
           resources:
             {{- toYaml .Values.controllerManager.resource | nindent 12 }}
           ports:
             - containerPort: 8443
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           volumeMounts:
             - name: webhook-certs
-              mountPath: /etc/webhook/certs
+              mountPath: /etc/tls
               readOnly: true
           livenessProbe:
             httpGet:
@@ -49,5 +72,6 @@ spec:
       volumes:
         - name: webhook-certs
           secret:
-            secretName: {{ include "kthena.name" . }}-webhook-certs
-      serviceAccountName: {{ include "kthena.name" . }}-kthena-controller-manager
+            secretName: {{ .Values.controllerManager.webhook.tls.certSecretName }}
+            optional: true
+      serviceAccountName: kthena-controller-manager

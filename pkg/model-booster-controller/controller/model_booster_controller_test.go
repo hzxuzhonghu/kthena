@@ -43,26 +43,31 @@ func TestReconcile(t *testing.T) {
 	assert.NotNil(t, controller)
 	// Start controller
 	go controller.Run(ctx, 1)
+	assert.True(t, waitForControllerCacheSync(controller), "controller informers did not sync")
 	// Load test data
 	model := loadYaml[workload.ModelBooster](t, "../convert/testdata/input/model.yaml")
 
-	// Case1: Create a model with ASP, and then model serving, model server, model route, ASP, ASP binding should be created.
+	// Case1: Create a model, then model serving, model server, and model route should be created.
 	// Step1. Create model
 	createdModel, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(model.Namespace).Create(ctx, model, metav1.CreateOptions{})
 	assert.NoError(t, err)
 	assert.NotNil(t, createdModel)
-	// Step2. Check that ASP, ASP binding, model serving, model server, model route are created
+	// Step2. Check that model serving, model server, and model route are created
 	assert.True(t, waitForCondition(func() bool {
-		aspBindings, err := kthenaClient.WorkloadV1alpha1().AutoscalingPolicyBindings(model.Namespace).List(ctx, metav1.ListOptions{})
+		modelServingList, err := kthenaClient.WorkloadV1alpha1().ModelServings(model.Namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return false
 		}
-		return len(aspBindings.Items) == 1
+		modelServers, err := kthenaClient.NetworkingV1alpha1().ModelServers(model.Namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return false
+		}
+		modelRoutes, err := kthenaClient.NetworkingV1alpha1().ModelRoutes(model.Namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return false
+		}
+		return len(modelServingList.Items) == 1 && len(modelServers.Items) == 1 && len(modelRoutes.Items) == 1
 	}))
-	// ASP should be created
-	aspList, err := kthenaClient.WorkloadV1alpha1().AutoscalingPolicies(model.Namespace).List(ctx, metav1.ListOptions{})
-	assert.NoError(t, err)
-	assert.Len(t, aspList.Items, 1, "Expected 1 AutoscalingPolicy to be created")
 	// model serving should be created
 	modelServingList, err := kthenaClient.WorkloadV1alpha1().ModelServings(model.Namespace).List(ctx, metav1.ListOptions{})
 	assert.NoError(t, err)
@@ -91,24 +96,20 @@ func TestReconcile(t *testing.T) {
 			string(workload.ModelStatusConditionTypeActive), metav1.ConditionTrue) && model.Generation == model.Status.ObservedGeneration
 	}))
 
-	// Case2: update model weight, and model route should be updated.
-	// Step1. update weight
-	weight := uint32(50)
-	model.Spec.Backends[0].RouteWeight = &weight
+	// Case2: noop update and ensure route still exists
 	model.Generation += 1
 	_, err = kthenaClient.WorkloadV1alpha1().ModelBoosters(model.Namespace).Update(ctx, model, metav1.UpdateOptions{})
 	assert.NoError(t, err)
-	// Step2. Check that model route is updated
 	assert.True(t, waitForCondition(func() bool {
-		modelRoutes, err = kthenaClient.NetworkingV1alpha1().ModelRoutes(model.Namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
+		routes, err := kthenaClient.NetworkingV1alpha1().ModelRoutes(model.Namespace).List(ctx, metav1.ListOptions{})
+		if err != nil || len(routes.Items) == 0 {
 			return false
 		}
-		return weight == *modelRoutes.Items[0].Spec.Rules[0].TargetModels[0].Weight
+		return true
 	}))
 
-	// Case3: delete model. Because we are not running in a real K8s cluster, model server, model route, model serving,
-	// ASP and ASP binding will not be deleted automatically. So here only check if model is deleted.
+	// Case3: delete model. Because we are not running in a real K8s cluster, model server, model route, and model serving
+	// will not be deleted automatically. So here only check if model is deleted.
 	err = kthenaClient.WorkloadV1alpha1().ModelBoosters(model.Namespace).Delete(ctx, model.Name, metav1.DeleteOptions{})
 	assert.NoError(t, err)
 	assert.True(t, waitForCondition(func() bool {
@@ -131,8 +132,10 @@ func TestReconcile_ReturnsError(t *testing.T) {
 	// start informers
 	go controller.modelsInformer.RunWithContext(ctx)
 	go controller.modelServingInformer.RunWithContext(ctx)
-	go controller.autoscalingPoliciesInformer.RunWithContext(ctx)
-	go controller.autoscalingPolicyBindingsInformer.RunWithContext(ctx)
+	assert.True(t, waitForCondition(func() bool {
+		return controller.modelsInformer.HasSynced() &&
+			controller.modelServingInformer.HasSynced()
+	}), "controller informers did not sync")
 	// Case1: Invalid namespaceAndName
 	t.Run("InvalidNameSpaceAndName", func(t *testing.T) {
 		err := controller.reconcile(ctx, "//")
@@ -147,11 +150,9 @@ func TestReconcile_ReturnsError(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: workload.ModelBoosterSpec{
-				Backends: []workload.ModelBackend{
-					{
-						Name: "not-supported-backend-type",
-						Type: workload.ModelBackendTypeMindIEDisaggregated,
-					},
+				Backend: workload.ModelBackend{
+					Name: "not-supported-backend-type",
+					Type: workload.ModelBackendTypeMindIEDisaggregated,
 				},
 			},
 		}
@@ -160,7 +161,7 @@ func TestReconcile_ReturnsError(t *testing.T) {
 		assert.NotNil(t, createdModel)
 		assert.True(t, waitForCondition(func() bool {
 			err = controller.reconcile(ctx, model.Namespace+"/"+model.Name)
-			return err.Error() == "not support model backend type: MindIEDisaggregated"
+			return err != nil && err.Error() == "not support model backend type: MindIEDisaggregated"
 		}))
 		get, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(model.Namespace).Get(ctx, model.Name, metav1.GetOptions{})
 		assert.NoError(t, err)
@@ -211,283 +212,7 @@ func TestTriggerModel(t *testing.T) {
 	assert.Equal(t, 0, controller.workQueue.Len())
 }
 
-func TestHasOnlyLoraAdaptersChanged(t *testing.T) {
-	kubeClient := fake.NewClientset()
-	kthenaClient := kthenafake.NewClientset()
-	controller := NewModelBoosterController(kubeClient, kthenaClient)
-
-	tests := []struct {
-		name     string
-		oldModel *workload.ModelBooster
-		newModel *workload.ModelBooster
-		expected bool
-	}{
-		{
-			name: "No changes at all",
-			oldModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend1",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-							},
-						},
-					},
-				},
-			},
-			newModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend1",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-							},
-						},
-					},
-				},
-			},
-			expected: false,
-		},
-		{
-			name: "Only LoRA adapters changed - added new adapter",
-			oldModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend1",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-								{Name: "adapter3", ArtifactURL: "uri3"},
-							},
-						},
-					},
-				},
-			},
-			newModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend1",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-								{Name: "adapter2", ArtifactURL: "uri2"},
-							},
-						},
-					},
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "Only LoRA adapters changed - modified adapter",
-			oldModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend1",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-							},
-						},
-					},
-				},
-			},
-			newModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend1",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1-modified"},
-							},
-						},
-					},
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "Backend name changed",
-			oldModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend1",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-							},
-						},
-					},
-				},
-			},
-			newModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend2",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-							},
-						},
-					},
-				},
-			},
-			expected: false,
-		},
-		{
-			name: "ModelBooster URI changed",
-			oldModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend1",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-							},
-						},
-					},
-				},
-			},
-			newModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend1",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri-changed",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-								{Name: "adapter2", ArtifactURL: "uri2"},
-							},
-						},
-					},
-				},
-			},
-			expected: false,
-		},
-		{
-			name: "Number of backends changed",
-			oldModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend1",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-							},
-						},
-					},
-				},
-			},
-			newModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "backend1",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-							},
-						},
-						{
-							Name:     "backend2",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri2",
-						},
-					},
-				},
-			},
-			expected: false,
-		},
-		{
-			name: "VLLM backend with LoRA adapters changed and other backend unchanged",
-			oldModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "vllm-backend",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-							},
-						},
-						{
-							Name:     "sglang-backend",
-							Type:     workload.ModelBackendTypeSGLang,
-							ModelURI: "model-uri2",
-						},
-					},
-				},
-			},
-			newModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{
-						{
-							Name:     "vllm-backend",
-							Type:     workload.ModelBackendTypeVLLM,
-							ModelURI: "model-uri",
-							LoraAdapters: []workload.LoraAdapter{
-								{Name: "adapter1", ArtifactURL: "uri1"},
-								{Name: "adapter2", ArtifactURL: "uri2"},
-							},
-						},
-						{
-							Name:     "sglang-backend",
-							Type:     workload.ModelBackendTypeSGLang,
-							ModelURI: "model-uri2",
-						},
-					},
-				},
-			},
-			expected: true,
-		},
-		{
-			name: "Empty backends",
-			oldModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{},
-				},
-			},
-			newModel: &workload.ModelBooster{
-				Spec: workload.ModelBoosterSpec{
-					Backends: []workload.ModelBackend{},
-				},
-			},
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := controller.hasOnlyLoraAdaptersChanged(tt.oldModel, tt.newModel)
-			assert.Equal(t, tt.expected, result, "Test case: %s", tt.name)
-		})
-	}
-}
+// Removed tests for LoRA adapter changes as the current API defines a single backend without loraAdapters
 
 // loadYaml transfer yaml data into a struct of type T.
 // Used for test.
@@ -501,6 +226,17 @@ func loadYaml[T any](t *testing.T, path string) *T {
 		t.Fatalf("Failed to unmarshal YAML: %v", err)
 	}
 	return &expected
+}
+
+// waitForControllerCacheSync waits until the informers started by Run() have completed initial sync.
+func waitForControllerCacheSync(controller *ModelBoosterController) bool {
+	return waitForCondition(func() bool {
+		return controller.modelsInformer.HasSynced() &&
+			controller.modelServingInformer.HasSynced() &&
+			controller.podsInformer.HasSynced() &&
+			controller.modelServersInformer.HasSynced() &&
+			controller.modelRoutesInformer.HasSynced()
+	})
 }
 
 // waitForCondition repeatedly checks a condition function until it returns true or a timeout occurs.

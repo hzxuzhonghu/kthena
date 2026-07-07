@@ -17,10 +17,24 @@ limitations under the License.
 package app
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"strconv"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
+	inferencev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayclientset "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
+	gatewayinformers "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
 
 	clientset "github.com/volcano-sh/kthena/client-go/clientset/versioned"
 	kthenaInformers "github.com/volcano-sh/kthena/client-go/informers/externalversions"
@@ -38,10 +52,17 @@ type aggregatedController struct {
 
 var _ Controller = &aggregatedController{}
 
-func startControllers(store datastore.Store, stop <-chan struct{}) Controller {
+func startControllers(store datastore.Store, stop <-chan struct{}, enableGatewayAPI bool, defaultPort string, enableGatewayAPIInferenceExtension bool, kubeAPIQPS float32, kubeAPIBurst int) Controller {
 	cfg, err := clientcmd.BuildConfigFromFlags("", "")
 	if err != nil {
 		klog.Fatalf("Error building kubeconfig: %s", err.Error())
+	}
+	// Set QPS and Burst if provided
+	if kubeAPIQPS > 0 {
+		cfg.QPS = kubeAPIQPS
+	}
+	if kubeAPIBurst > 0 {
+		cfg.Burst = kubeAPIBurst
 	}
 
 	kubeClient, err := kubernetes.NewForConfig(cfg)
@@ -56,30 +77,124 @@ func startControllers(store datastore.Store, stop <-chan struct{}) Controller {
 
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
 	kthenaInformerFactory := kthenaInformers.NewSharedInformerFactory(kthenaClient, 0)
+	modelRouteController, err := controller.NewModelRouteController(kthenaInformerFactory, store)
+	if err != nil {
+		klog.Fatalf("Error creating model route controller: %s", err.Error())
+	}
+	modelServerController, err := controller.NewModelServerController(kthenaInformerFactory, kubeInformerFactory, store)
+	if err != nil {
+		klog.Fatalf("Error creating model server controller: %s", err.Error())
+	}
 
-	modelRouteController := controller.NewModelRouteController(kthenaInformerFactory, store)
-	modelServerController := controller.NewModelServerController(kthenaInformerFactory, kubeInformerFactory, store)
+	cacheSyncs := []cache.InformerSynced{
+		kthenaInformerFactory.Networking().V1alpha1().ModelRoutes().Informer().HasSynced,
+		kthenaInformerFactory.Networking().V1alpha1().ModelServers().Informer().HasSynced,
+		kubeInformerFactory.Core().V1().Pods().Informer().HasSynced,
+	}
+
+	var gatewayInformerFactory gatewayinformers.SharedInformerFactory
+	var gatewayController *controller.GatewayController
+	var httpRouteController *controller.HTTPRouteController
+	var inferencePoolController *controller.InferencePoolController
+
+	if enableGatewayAPI {
+		gatewayClient, err := gatewayclientset.NewForConfig(cfg)
+		if err != nil {
+			klog.Fatalf("Error building gateway clientset: %s", err.Error())
+		}
+
+		// Ensure default GatewayClass exists before starting controllers
+		if err := ensureDefaultGatewayClass(gatewayClient); err != nil {
+			klog.Fatalf("Failed to ensure default GatewayClass: %s", err.Error())
+		}
+
+		// Ensure default Gateway exists before starting controllers
+		if err := ensureDefaultGateway(gatewayClient, defaultPort); err != nil {
+			klog.Fatalf("Failed to ensure default Gateway: %s", err.Error())
+		}
+		gatewayInformerFactory = gatewayinformers.NewSharedInformerFactory(gatewayClient, 0)
+		gatewayController, err = controller.NewGatewayController(gatewayInformerFactory, store)
+		if err != nil {
+			klog.Fatalf("Error creating gateway controller: %s", err.Error())
+		}
+		cacheSyncs = append(cacheSyncs,
+			gatewayInformerFactory.Gateway().V1().Gateways().Informer().HasSynced,
+			gatewayInformerFactory.Gateway().V1().HTTPRoutes().Informer().HasSynced,
+		)
+		if enableGatewayAPIInferenceExtension {
+			httpRouteController, err = controller.NewHTTPRouteController(gatewayInformerFactory, kubeInformerFactory, store)
+			if err != nil {
+				klog.Fatalf("Error creating httproute controller: %s", err.Error())
+			}
+			dynamicClient, err := dynamic.NewForConfig(cfg)
+			if err != nil {
+				klog.Fatalf("Error building dynamic client: %s", err.Error())
+			}
+			dynamicInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 0)
+			inferencePoolController, err = controller.NewInferencePoolController(dynamicInformerFactory, store)
+			if err != nil {
+				klog.Fatalf("Error creating inferencepool controller: %s", err.Error())
+			}
+			cacheSyncs = append(cacheSyncs,
+				kubeInformerFactory.Core().V1().Namespaces().Informer().HasSynced,
+				dynamicInformerFactory.ForResource(inferencev1.SchemeGroupVersion.WithResource("inferencepools")).Informer().HasSynced,
+			)
+			dynamicInformerFactory.Start(stop)
+		}
+		gatewayInformerFactory.Start(stop)
+	} else {
+		klog.Info("Gateway API controllers are disabled")
+	}
 
 	kubeInformerFactory.Start(stop)
 	kthenaInformerFactory.Start(stop)
+
+	if !cache.WaitForCacheSync(stop, cacheSyncs...) {
+		klog.Fatalf("Failed to sync informer caches")
+	}
+
+	controllers := []Controller{modelRouteController, modelServerController}
 
 	go func() {
 		if err := modelRouteController.Run(stop); err != nil {
 			klog.Fatalf("Error running model route controller: %s", err.Error())
 		}
 	}()
-
 	go func() {
 		if err := modelServerController.Run(stop); err != nil {
 			klog.Fatalf("Error running model server controller: %s", err.Error())
 		}
 	}()
 
+	if enableGatewayAPI {
+		go func() {
+			if err := gatewayController.Run(stop); err != nil {
+				klog.Fatalf("Error running gateway controller: %s", err.Error())
+			}
+		}()
+
+		controllers = append(controllers, gatewayController)
+
+		// Gateway API Inference Extension controllers are optional
+		if enableGatewayAPIInferenceExtension {
+			go func() {
+				if err := httpRouteController.Run(stop); err != nil {
+					klog.Fatalf("Error running httproute controller: %s", err.Error())
+				}
+			}()
+			go func() {
+				if err := inferencePoolController.Run(stop); err != nil {
+					klog.Fatalf("Error running inferencepool controller: %s", err.Error())
+				}
+			}()
+			controllers = append(controllers, httpRouteController, inferencePoolController)
+		} else {
+			klog.Info("Gateway API Inference Extension controllers are disabled")
+		}
+	}
+
 	return &aggregatedController{
-		controllers: []Controller{
-			modelRouteController,
-			modelServerController,
-		},
+		controllers: controllers,
 	}
 }
 
@@ -90,4 +205,107 @@ func (c *aggregatedController) HasSynced() bool {
 		}
 	}
 	return true
+}
+
+// ensureDefaultGatewayClass creates the default GatewayClass if it doesn't exist
+func ensureDefaultGatewayClass(gatewayClient gatewayclientset.Interface) error {
+	ctx := context.Background()
+
+	// Check if GatewayClass already exists
+	_, err := gatewayClient.GatewayV1().GatewayClasses().Get(ctx, controller.DefaultGatewayClassName, metav1.GetOptions{})
+	if err == nil {
+		klog.V(2).Infof("Default GatewayClass %s already exists", controller.DefaultGatewayClassName)
+		return nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to check GatewayClass %s: %w", controller.DefaultGatewayClassName, err)
+	}
+
+	// Create the default GatewayClass
+	gatewayClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: controller.DefaultGatewayClassName,
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: gatewayv1.GatewayController(controller.ControllerName),
+		},
+	}
+
+	_, err = gatewayClient.GatewayV1().GatewayClasses().Create(ctx, gatewayClass, metav1.CreateOptions{})
+	if err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			klog.V(2).Infof("GatewayClass %s was created by another process", controller.DefaultGatewayClassName)
+			return nil
+		}
+		return fmt.Errorf("failed to create GatewayClass %s: %w", controller.DefaultGatewayClassName, err)
+	}
+
+	klog.Infof("Created default GatewayClass %s", controller.DefaultGatewayClassName)
+	return nil
+}
+
+// ensureDefaultGateway creates the default Gateway if it doesn't exist
+func ensureDefaultGateway(gatewayClient gatewayclientset.Interface, defaultPort string) error {
+	ctx := context.Background()
+	namespace := "default"
+	name := "default"
+
+	// Get namespace from environment variable if available, otherwise use "default"
+	if podNamespace := os.Getenv("POD_NAMESPACE"); podNamespace != "" {
+		namespace = podNamespace
+	}
+
+	// Parse port
+	port, err := strconv.Atoi(defaultPort)
+	if err != nil {
+		return fmt.Errorf("invalid default port %s: %w", defaultPort, err)
+	}
+
+	// Check if Gateway already exists
+	_, err = gatewayClient.GatewayV1().Gateways(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		klog.V(2).Infof("Default Gateway %s/%s already exists", namespace, name)
+		return nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to check Gateway %s/%s: %w", namespace, name, err)
+	}
+
+	namespacesFromAll := gatewayv1.NamespacesFromAll
+
+	// Create the default Gateway
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: gatewayv1.ObjectName(controller.DefaultGatewayClassName),
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     gatewayv1.SectionName("default"),
+					Port:     gatewayv1.PortNumber(port),
+					Protocol: gatewayv1.HTTPProtocolType,
+					AllowedRoutes: &gatewayv1.AllowedRoutes{
+						Namespaces: &gatewayv1.RouteNamespaces{From: &namespacesFromAll},
+					},
+					// Hostname is nil, meaning match all hostnames
+				},
+			},
+		},
+	}
+
+	_, err = gatewayClient.GatewayV1().Gateways(namespace).Create(ctx, gateway, metav1.CreateOptions{})
+	if err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			klog.V(2).Infof("Gateway %s/%s was created by another process", namespace, name)
+			return nil
+		}
+		return fmt.Errorf("failed to create Gateway %s/%s: %w", namespace, name, err)
+	}
+
+	klog.Infof("Created default Gateway %s/%s", namespace, name)
+	return nil
 }

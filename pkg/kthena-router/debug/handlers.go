@@ -17,11 +17,14 @@ limitations under the License.
 package debug
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"k8s.io/apimachinery/pkg/types"
+	inferencev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
@@ -58,6 +61,8 @@ type ModelServerResponse struct {
 	Namespace      string                     `json:"namespace"`
 	Spec           aiv1alpha1.ModelServerSpec `json:"spec"`
 	AssociatedPods []string                   `json:"associatedPods,omitempty"`
+	DecodePods     []string                   `json:"decodePods,omitempty"`
+	PrefillPods    []string                   `json:"prefillPods,omitempty"`
 }
 
 type PodResponse struct {
@@ -84,6 +89,27 @@ type Metrics struct {
 	RequestRunningNum float64 `json:"requestRunningNum"`
 	TPOT              float64 `json:"tpot"`
 	TTFT              float64 `json:"ttft"`
+}
+
+type GatewayResponse struct {
+	Name      string                  `json:"name"`
+	Namespace string                  `json:"namespace"`
+	Spec      gatewayv1.GatewaySpec   `json:"spec"`
+	Status    gatewayv1.GatewayStatus `json:"status,omitempty"`
+}
+
+type HTTPRouteResponse struct {
+	Name      string                    `json:"name"`
+	Namespace string                    `json:"namespace"`
+	Spec      gatewayv1.HTTPRouteSpec   `json:"spec"`
+	Status    gatewayv1.HTTPRouteStatus `json:"status,omitempty"`
+}
+
+type InferencePoolResponse struct {
+	Name      string                          `json:"name"`
+	Namespace string                          `json:"namespace"`
+	Spec      inferencev1.InferencePoolSpec   `json:"spec"`
+	Status    inferencev1.InferencePoolStatus `json:"status,omitempty"`
 }
 
 // List endpoints
@@ -127,11 +153,33 @@ func (h *DebugHandler) ListModelServers(c *gin.Context) {
 		if pods, err := h.store.GetPodsByModelServer(namespacedName); err == nil {
 			var podNames []string
 			for _, pod := range pods {
-				if pod.Pod != nil {
-					podNames = append(podNames, pod.Pod.Namespace+"/"+pod.Pod.Name)
+				if podName := pod.GetPodNamespacedName(); podName.Name != "" {
+					podNames = append(podNames, podName.Namespace+"/"+podName.Name)
 				}
 			}
 			response.AssociatedPods = podNames
+		}
+
+		// Get decode pods
+		if decodePods, err := h.store.GetDecodePods(namespacedName); err == nil {
+			var decodePodNames []string
+			for _, pod := range decodePods {
+				if podName := pod.GetPodNamespacedName(); podName.Name != "" {
+					decodePodNames = append(decodePodNames, podName.Namespace+"/"+podName.Name)
+				}
+			}
+			response.DecodePods = decodePodNames
+		}
+
+		// Get prefill pods
+		if prefillPods, err := h.store.GetPrefillPods(namespacedName); err == nil {
+			var prefillPodNames []string
+			for _, pod := range prefillPods {
+				if podName := pod.GetPodNamespacedName(); podName.Name != "" {
+					prefillPodNames = append(prefillPodNames, podName.Namespace+"/"+podName.Name)
+				}
+			}
+			response.PrefillPods = prefillPodNames
 		}
 
 		responses = append(responses, response)
@@ -151,6 +199,66 @@ func (h *DebugHandler) ListPods(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"pods": responses})
+}
+
+// ListGateways handles GET /debug/config_dump/gateways
+func (h *DebugHandler) ListGateways(c *gin.Context) {
+	gateways := h.store.GetAllGateways()
+
+	var responses []GatewayResponse
+	for _, gw := range gateways {
+		response := GatewayResponse{
+			Name:      gw.Name,
+			Namespace: gw.Namespace,
+			Spec:      gw.Spec,
+			Status:    gw.Status,
+		}
+		responses = append(responses, response)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"gateways": responses})
+}
+
+// ListHTTPRoutes handles GET /debug/config_dump/httproutes
+func (h *DebugHandler) ListHTTPRoutes(c *gin.Context) {
+	httpRoutes := h.store.GetAllHTTPRoutes()
+
+	var responses []HTTPRouteResponse
+	for _, hr := range httpRoutes {
+		if hr == nil {
+			continue
+		}
+		response := HTTPRouteResponse{
+			Name:      hr.Name,
+			Namespace: hr.Namespace,
+			Spec:      hr.Spec,
+			Status:    hr.Status,
+		}
+		responses = append(responses, response)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"httproutes": responses})
+}
+
+// ListInferencePools handles GET /debug/config_dump/inferencepools
+func (h *DebugHandler) ListInferencePools(c *gin.Context) {
+	inferencePools := h.store.GetAllInferencePools()
+
+	var responses []InferencePoolResponse
+	for _, ip := range inferencePools {
+		if ip == nil {
+			continue
+		}
+		response := InferencePoolResponse{
+			Name:      ip.Name,
+			Namespace: ip.Namespace,
+			Spec:      ip.Spec,
+			Status:    ip.Status,
+		}
+		responses = append(responses, response)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"inferencepools": responses})
 }
 
 // Get specific resource endpoints
@@ -213,11 +321,33 @@ func (h *DebugHandler) GetModelServer(c *gin.Context) {
 	if pods, err := h.store.GetPodsByModelServer(namespacedName); err == nil {
 		var podNames []string
 		for _, pod := range pods {
-			if pod.Pod != nil {
-				podNames = append(podNames, pod.Pod.Namespace+"/"+pod.Pod.Name)
+			if podName := pod.GetPodNamespacedName(); podName.Name != "" {
+				podNames = append(podNames, podName.Namespace+"/"+podName.Name)
 			}
 		}
 		response.AssociatedPods = podNames
+	}
+
+	// Get decode pods
+	if decodePods, err := h.store.GetDecodePods(namespacedName); err == nil {
+		var decodePodNames []string
+		for _, pod := range decodePods {
+			if podName := pod.GetPodNamespacedName(); podName.Name != "" {
+				decodePodNames = append(decodePodNames, podName.Namespace+"/"+podName.Name)
+			}
+		}
+		response.DecodePods = decodePodNames
+	}
+
+	// Get prefill pods
+	if prefillPods, err := h.store.GetPrefillPods(namespacedName); err == nil {
+		var prefillPodNames []string
+		for _, pod := range prefillPods {
+			if podName := pod.GetPodNamespacedName(); podName.Name != "" {
+				prefillPodNames = append(prefillPodNames, podName.Namespace+"/"+podName.Name)
+			}
+		}
+		response.PrefillPods = prefillPodNames
 	}
 
 	c.JSON(http.StatusOK, response)
@@ -248,6 +378,90 @@ func (h *DebugHandler) GetPod(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+// GetGateway handles GET /debug/config_dump/namespaces/{namespace}/gateways/{name}
+func (h *DebugHandler) GetGateway(c *gin.Context) {
+	namespace := c.Param("namespace")
+	name := c.Param("name")
+
+	if namespace == "" || name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name parameters are required"})
+		return
+	}
+
+	key := fmt.Sprintf("%s/%s", namespace, name)
+	gw := h.store.GetGateway(key)
+
+	if gw == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Gateway not found"})
+		return
+	}
+
+	response := GatewayResponse{
+		Name:      name,
+		Namespace: namespace,
+		Spec:      gw.Spec,
+		Status:    gw.Status,
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// GetHTTPRoute handles GET /debug/config_dump/namespaces/{namespace}/httproutes/{name}
+func (h *DebugHandler) GetHTTPRoute(c *gin.Context) {
+	namespace := c.Param("namespace")
+	name := c.Param("name")
+
+	if namespace == "" || name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name parameters are required"})
+		return
+	}
+
+	key := fmt.Sprintf("%s/%s", namespace, name)
+	hr := h.store.GetHTTPRoute(key)
+
+	if hr == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "HTTPRoute not found"})
+		return
+	}
+
+	response := HTTPRouteResponse{
+		Name:      name,
+		Namespace: namespace,
+		Spec:      hr.Spec,
+		Status:    hr.Status,
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// GetInferencePool handles GET /debug/config_dump/namespaces/{namespace}/inferencepools/{name}
+func (h *DebugHandler) GetInferencePool(c *gin.Context) {
+	namespace := c.Param("namespace")
+	name := c.Param("name")
+
+	if namespace == "" || name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name parameters are required"})
+		return
+	}
+
+	key := fmt.Sprintf("%s/%s", namespace, name)
+	ip := h.store.GetInferencePool(key)
+
+	if ip == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "InferencePool not found"})
+		return
+	}
+
+	response := InferencePoolResponse{
+		Name:      name,
+		Namespace: namespace,
+		Spec:      ip.Spec,
+		Status:    ip.Status,
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
 // Helper methods
 
 func (h *DebugHandler) convertPodInfoToResponse(namespacedName types.NamespacedName, podInfo *datastore.PodInfo, includeDetails bool) PodResponse {
@@ -268,24 +482,24 @@ func (h *DebugHandler) convertPodInfoToResponse(namespacedName types.NamespacedN
 
 	// Add metrics
 	response.Metrics = &Metrics{
-		GPUCacheUsage:     podInfo.GPUCacheUsage,
-		RequestWaitingNum: podInfo.RequestWaitingNum,
-		RequestRunningNum: podInfo.RequestRunningNum,
-		TPOT:              podInfo.TPOT,
-		TTFT:              podInfo.TTFT,
+		GPUCacheUsage:     podInfo.GetGPUCacheUsage(),
+		RequestWaitingNum: podInfo.GetRequestWaitingNum(),
+		RequestRunningNum: podInfo.GetRequestRunningNum(),
+		TPOT:              podInfo.GetTPOT(),
+		TTFT:              podInfo.GetTTFT(),
 	}
 
 	// Add pod info if details are requested
-	if includeDetails && podInfo.Pod != nil {
+	if pod := podInfo.GetPod(); includeDetails && pod != nil {
 		response.PodInfo = &PodInfo{
-			PodIP:    podInfo.Pod.Status.PodIP,
-			NodeName: podInfo.Pod.Spec.NodeName,
-			Phase:    string(podInfo.Pod.Status.Phase),
-			Labels:   podInfo.Pod.Labels,
+			PodIP:    pod.Status.PodIP,
+			NodeName: pod.Spec.NodeName,
+			Phase:    string(pod.Status.Phase),
+			Labels:   podInfo.GetPodLabels(),
 		}
 
-		if podInfo.Pod.Status.StartTime != nil {
-			response.PodInfo.StartTime = podInfo.Pod.Status.StartTime.Format("2006-01-02T15:04:05Z")
+		if pod.Status.StartTime != nil {
+			response.PodInfo.StartTime = pod.Status.StartTime.Format("2006-01-02T15:04:05Z")
 		}
 	}
 

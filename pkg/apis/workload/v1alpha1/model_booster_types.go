@@ -34,20 +34,9 @@ type ModelBoosterSpec struct {
 	// Owner is the owner of the model.
 	// +optional
 	Owner string `json:"owner,omitempty"`
-	// Backends is the list of model backends associated with this model. A ModelBooster CR at lease has one ModelBackend.
-	// ModelBackend is the minimum unit of inference instance. It can be vLLM, SGLang, MindIE or other types.
-	// +kubebuilder:validation:MinItems=1
-	// +listType=map
-	// +listMapKey=name
-	Backends []ModelBackend `json:"backends"`
-	// AutoscalingPolicy references the autoscaling policy to be used for this model.
-	// +optional
-	AutoscalingPolicy *AutoscalingPolicySpec `json:"autoscalingPolicy,omitempty"`
-	// CostExpansionRatePercent is the percentage rate at which the cost expands.
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=1000
-	// +optional
-	CostExpansionRatePercent *int32 `json:"costExpansionRatePercent,omitempty"`
+	// Backend is the model backend associated with this model.
+	// ModelBackend is the minimum unit of inference instance. It can be vLLM or vLLMDisaggregated.
+	Backend ModelBackend `json:"backend"`
 	// ModelMatch defines the predicate used to match LLM inference requests to a given
 	// TargetModels. Multiple match conditions are ANDed together, i.e. the match will
 	// evaluate to true only if all conditions are satisfied.
@@ -63,8 +52,8 @@ type ModelBackend struct {
 	Name string `json:"name"`
 	// Type is the type of the backend.
 	Type ModelBackendType `json:"type"`
-	// ModelURI is the URI where you download the model. Support hf://, s3://, pvc://.
-	// +kubebuilder:validation:Pattern=`^(hf://|s3://|pvc://).+`
+	// ModelURI is the URI where you download the model. Support hf://, s3://, pvc://, ms://.
+	// +kubebuilder:validation:Pattern=`^(hf://|s3://|pvc://|ms://).+`
 	ModelURI string `json:"modelURI"`
 	// CacheURI is the URI where the downloaded model stored. Support hostpath://, pvc://.
 	// +kubebuilder:validation:Pattern=`^(hostpath://|pvc://).+`
@@ -85,6 +74,7 @@ type ModelBackend struct {
 	// "RUNTIME_PORT": default is 8100
 	// "RUNTIME_METRICS_PATH": default is /metrics
 	// "HF_ENDPOINT":The url of hugging face. Default is https://huggingface.co/
+	// "KTHENA_SKIP_ENGINE_DEPENDENCY_INSTALL": default is false. When set to true, skip startup-time pip install of engine connector dependencies.
 	// Cannot be updated.
 	// +optional
 	// +patchMergeKey=name
@@ -92,52 +82,26 @@ type ModelBackend struct {
 	// +listType=map
 	// +listMapKey=name
 	Env []corev1.EnvVar `json:"env,omitempty" patchStrategy:"merge" patchMergeKey:"name" protobuf:"bytes,7,rep,name=env"`
-	// MinReplicas is the minimum number of replicas for the backend.
+	// Replicas is the fixed number of replicas for the backend.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=1000000
-	MinReplicas int32 `json:"minReplicas"`
-	// MaxReplicas is the maximum number of replicas for the backend.
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=1000000
-	MaxReplicas int32 `json:"maxReplicas"`
-	// ScalingCost is the cost associated with running this backend.
-	// +kubebuilder:validation:Minimum=0
-	// +optional
-	ScalingCost int32 `json:"scalingCost,omitempty"`
-	// RouteWeight is used to specify the percentage of traffic should be sent to the target backend.
-	// It's used to create model route.
-	// +optional
-	// +kubebuilder:default=100
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=100
-	RouteWeight *uint32 `json:"routeWeight,omitempty"`
-	// ScaleToZeroGracePeriod is the duration to wait before scaling to zero.
-	// +optional
-	ScaleToZeroGracePeriod *metav1.Duration `json:"scaleToZeroGracePeriod,omitempty"`
+	Replicas int32 `json:"replicas"`
 	// Workers is the list of workers associated with this backend.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=1000
 	Workers []ModelWorker `json:"workers"`
-	// LoraAdapter is a list of LoRA adapters.
-	// +optional
-	LoraAdapters []LoraAdapter `json:"loraAdapters,omitempty"`
-	// AutoscalingPolicyRef references the autoscaling policy for this backend.
-	// +optional
-	AutoscalingPolicy *AutoscalingPolicySpec `json:"autoscalingPolicy,omitempty"`
-}
 
-// LoraAdapter defines a LoRA (Low-Rank Adaptation) adapter configuration.
-type LoraAdapter struct {
-	// Name is the name of the LoRA adapter.
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
-	Name string `json:"name"`
-	// ArtifactURL is the URL where the LoRA adapter artifact is stored.
-	// +kubebuilder:validation:Pattern=`^(hf://|s3://|pvc://).+`
-	ArtifactURL string `json:"artifactURL"`
+	// SchedulerName defines the name of the scheduler used by ModelServing for this backend.
+	// +optional
+	SchedulerName string `json:"schedulerName,omitempty"`
+	// RuntimeClassName refers to a RuntimeClass object in the node.k8s.io group,
+	// which should be used to run pods generated for this backend.
+	// +optional
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 }
 
 // ModelBackendType defines the type of model backend.
-// +kubebuilder:validation:Enum=vLLM;vLLMDisaggregated;SGLang;MindIE;MindIEDisaggregated
+// +kubebuilder:validation:Enum=vLLM;vLLMDisaggregated
 type ModelBackendType string
 
 const (
@@ -174,6 +138,10 @@ type ModelWorker struct {
 	// Affinity specifies the affinity rules for scheduling the worker pods.
 	// +optional
 	Affinity corev1.Affinity `json:"affinity,omitempty"`
+	// Tolerations specifies the tolerations for scheduling the worker pods.
+	// +optional
+	// +listType=atomic
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 	// Config contains worker-specific configuration in JSON format.
 	// You can find vLLM config here https://docs.vllm.ai/en/stable/configuration/engine_args.html
 	// +optional
@@ -203,9 +171,6 @@ type ModelStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-	// BackendStatuses contains the status of each backend.
-	// +listType=atomic
-	BackendStatuses []ModelBackendStatus `json:"backendStatuses,omitempty"`
 	// ObservedGeneration track of generation
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
@@ -218,14 +183,6 @@ const (
 	ModelStatusConditionTypeActive      ModelStatusConditionType = "Active"
 	ModelStatusConditionTypeFailed      ModelStatusConditionType = "Failed"
 )
-
-// ModelBackendStatus defines the status of a model backend.
-type ModelBackendStatus struct {
-	// Name is the name of the backend.
-	Name string `json:"name"`
-	// Replicas is the number of replicas currently running for the backend.
-	Replicas int32 `json:"replicas"`
-}
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status

@@ -23,6 +23,8 @@ import (
 	"net/http"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/volcano-sh/kthena/pkg/kthena-router/backend/metrics"
 )
 
 type Model struct {
@@ -33,13 +35,17 @@ type ModelList struct {
 	Data []Model `json:"data"`
 }
 
-func (engine *vllmEngine) GetPodModels(pod *corev1.Pod) ([]string, error) {
-	url := fmt.Sprintf("http://%s:%d/v1/models", pod.Status.PodIP, engine.MetricPort)
-	resp, err := http.Get(url)
+func FetchPodModels(podIP string, port uint32) ([]string, error) {
+	url := metrics.PodEndpointURL(podIP, port, "/v1/models")
+	resp, err := metrics.HTTPClient().Get(url)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get models from pod IP %s: HTTP %d", podIP, resp.StatusCode)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -57,4 +63,11 @@ func (engine *vllmEngine) GetPodModels(pod *corev1.Pod) ([]string, error) {
 		models = append(models, model.ID)
 	}
 	return models, nil
+}
+
+func (engine *vllmEngine) GetPodModels(pod *corev1.Pod, port uint32) ([]string, error) {
+	if port == 0 {
+		port = 8000
+	}
+	return FetchPodModels(pod.Status.PodIP, port)
 }

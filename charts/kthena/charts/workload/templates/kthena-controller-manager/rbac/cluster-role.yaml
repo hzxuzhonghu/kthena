@@ -16,20 +16,27 @@ rules:
       - patch
       - get
   - apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
       - workload.serving.volcano.sh
     resources:
-      - autoscalingpolicybindings
       - autoscalingpolicies
     verbs:
       - get
       - list
       - patch
       - watch
+      - create
   - apiGroups:
       - workload.serving.volcano.sh
     resources:
       - autoscalingpolicies/status
-      - autoscalingpolicybindings/status
     verbs:
       - create
       - get
@@ -59,6 +66,14 @@ rules:
       - get
       - list
       - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+      - update
   - apiGroups:
       - coordination.k8s.io
     resources:
@@ -111,10 +126,57 @@ rules:
       - list
       - watch
   - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+      - get
+      - list
+      - watch
+  - apiGroups:
       - scheduling.volcano.sh
     resources:
       - podgroups
     verbs:
+      - create
       - get
       - list
       - watch
+      - update
+      - delete
+  - apiGroups:
+      - admissionregistration.k8s.io
+    resources:
+      - mutatingwebhookconfigurations
+      - validatingwebhookconfigurations
+    verbs:
+      - get
+      - update
+      - patch
+  - apiGroups:
+      - apps
+    resources:
+      - controllerrevisions
+    verbs:
+      - create
+      - get
+      - list
+      - update
+      - delete
+  - apiGroups:
+      - leaderworkerset.x-k8s.io
+    resources:
+      - leaderworkersets
+      - leaderworkersets/status
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - apiresources
+    verbs:
+      - get

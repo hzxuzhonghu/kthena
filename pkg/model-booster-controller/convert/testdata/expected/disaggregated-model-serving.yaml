@@ -6,31 +6,36 @@ metadata:
     workload.serving.volcano.sh/managed-by: workload.serving.volcano.sh
     workload.serving.volcano.sh/model-name: ds-r1-qwen-7b-pd
     workload.serving.volcano.sh/model-uid: randomUID
-    workload.serving.volcano.sh/revision: 67cc57ffd4
+    workload.serving.volcano.sh/revision: 68df7d9886
   name: ds-r1-qwen-7b-pd-ds-r1-qwen-7b-pd
   namespace: demo
   ownerReferences:
     - apiVersion: workload.serving.volcano.sh/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
       kind: ModelBooster
       name: ds-r1-qwen-7b-pd
       uid: randomUID
 spec:
   replicas: 1
-  schedulerName: volcano
+  schedulerName: "volcano"
   template:
     restartGracePeriodSeconds: 60
+    gangPolicy:
+      minRoleReplicas:
+        prefill: 1
+        decode: 1
     roles:
       - entryTemplate:
+          metadata:
+            labels:
+              workload.serving.volcano.sh/backend-name: ds-r1-qwen-7b-pd
+              workload.serving.volcano.sh/managed-by: workload.serving.volcano.sh
+              workload.serving.volcano.sh/model-name: ds-r1-qwen-7b-pd
+              workload.serving.volcano.sh/model-uid: randomUID
+              workload.serving.volcano.sh/revision: 68df7d9886
           spec:
-            affinity:
-              nodeAffinity:
-                requiredDuringSchedulingIgnoredDuringExecution:
-                  nodeSelectorTerms:
-                    - matchExpressions:
-                        - key: node.kubernetes.io/npu.chip.name
-                          operator: In
-                          values:
-                            - Ascend910
+            affinity: {}
             containers:
               - args:
                   - --port
@@ -88,7 +93,7 @@ spec:
                   - containerPort: 8100
                 resources: {}
               - command:
-                  - python
+                  - python3
                   - -m
                   - vllm.entrypoints.openai.api_server
                   - --model
@@ -97,7 +102,7 @@ spec:
                   - --gpu-memory-utilization
                   - "0.99"
                   - --kv-transfer-config
-                  - '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_producer","kv_connector_extra_config":{"prefill":{"dp_size":2,"tp_size":2},"decode":{"dp_size":2,"tp_size":2}}}'
+                  - '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_connector_extra_config":{"prefill":{"dp_size":2,"tp_size":2},"decode":{"dp_size":2,"tp_size":2}}}'
                   - --max-model-len
                   - "2048"
                   - --quantization
@@ -107,8 +112,7 @@ spec:
                   - --tensor-parallel-size
                   - "16"
                   - --trust-remote-code
-                  - --kv-events-config
-                  - '{"enable_kv_cache_events":true,"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}'
+                  
                 env:
                   - name: ENDPOINT
                     value: https://obs.test.com
@@ -153,7 +157,7 @@ spec:
                   httpGet:
                     path: /health
                     port: 8000
-                  initialDelaySeconds: 90
+                  initialDelaySeconds: 180
                   periodSeconds: 5
                 name: vllm
                 ports:
@@ -207,16 +211,15 @@ spec:
           spec:
             containers: []
       - entryTemplate:
+          metadata:
+            labels:
+              workload.serving.volcano.sh/backend-name: ds-r1-qwen-7b-pd
+              workload.serving.volcano.sh/managed-by: workload.serving.volcano.sh
+              workload.serving.volcano.sh/model-name: ds-r1-qwen-7b-pd
+              workload.serving.volcano.sh/model-uid: randomUID
+              workload.serving.volcano.sh/revision: 68df7d9886
           spec:
-            affinity:
-              nodeAffinity:
-                requiredDuringSchedulingIgnoredDuringExecution:
-                  nodeSelectorTerms:
-                    - matchExpressions:
-                        - key: node.kubernetes.io/npu.chip.name
-                          operator: In
-                          values:
-                            - Ascend910
+            affinity: {}
             containers:
               - args:
                   - --port
@@ -279,7 +282,7 @@ spec:
                   - containerPort: 8100
                 resources: {}
               - command:
-                  - python
+                  - python3
                   - -m
                   - vllm.entrypoints.openai.api_server
                   - --model
@@ -288,7 +291,7 @@ spec:
                   - --gpu-memory-utilization
                   - "0.95"
                   - --kv-transfer-config
-                  - '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_consumer","kv_connector_extra_config":{"prefill":{"dp_size":2,"tp_size":2},"decode":{"dp_size":2,"tp_size":2}}}'
+                  - '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"prefill":{"dp_size":2,"tp_size":2},"decode":{"dp_size":2,"tp_size":2}}}'
                   - --max-model-len
                   - "1024"
                   - --quantization
@@ -298,8 +301,7 @@ spec:
                   - --tensor-parallel-size
                   - "16"
                   - --trust-remote-code
-                  - --kv-events-config
-                  - '{"enable_kv_cache_events":true,"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}'
+                  
                 env:
                   - name: ENDPOINT
                     value: https://obs.test.com
@@ -346,7 +348,7 @@ spec:
                   httpGet:
                     path: /health
                     port: 8000
-                  initialDelaySeconds: 90
+                  initialDelaySeconds: 180
                   periodSeconds: 5
                 name: vllm
                 ports:

@@ -23,11 +23,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
-	clientset "github.com/volcano-sh/kthena/client-go/clientset/versioned/fake"
 	networkingv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 )
 
 func TestValidateModelRoute(t *testing.T) {
+	weight0 := uint32(0)
+	invalidHeaderRegex := "["
+	invalidURIRegex := "["
+
 	tests := []struct {
 		name           string
 		modelRoute     *networkingv1alpha1.ModelRoute
@@ -109,6 +112,32 @@ func TestValidateModelRoute(t *testing.T) {
 								{
 									ModelServerName: "test-server",
 								},
+							},
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "valid model route with default and zero weights",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name: "test-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{
+								{ModelServerName: "test-server-1"},
+								{ModelServerName: "test-server-2", Weight: &weight0},
 							},
 						},
 					},
@@ -256,12 +285,224 @@ func TestValidateModelRoute(t *testing.T) {
 			expectValid:    false,
 			expectedReason: "validation failed:   - spec: Required value: either modelName or loraAdapters must be specified",
 		},
+		{
+			name: "invalid model route - rule with empty targetModels",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name:         "empty-targets-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.rules[0].targetModels: Required value: each rule must have at least one target model",
+		},
+		{
+			name: "invalid model route - multiple rules with empty targetModels",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name: "valid-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{
+								{ModelServerName: "test-server"},
+							},
+						},
+						{
+							Name:         "empty-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.rules[1].targetModels: Required value: each rule must have at least one target model",
+		},
+		{
+			name: "invalid model route - empty modelServerName",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name: "test-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{
+								{ModelServerName: ""},
+							},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.rules[0].targetModels[0].modelServerName: Invalid value: \"\": modelServerName cannot be an empty string",
+		},
+		{
+			name: "invalid model route - all target weights are zero",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name: "test-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{
+								{ModelServerName: "test-server-1", Weight: &weight0},
+								{ModelServerName: "test-server-2", Weight: &weight0},
+							},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.rules[0].targetModels: Invalid value: 0: total weight must be greater than zero",
+		},
+		{
+			name: "invalid model route - invalid header regex",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name: "test-rule",
+							ModelMatch: &networkingv1alpha1.ModelMatch{
+								Headers: map[string]*networkingv1alpha1.StringMatch{
+									"x-user": {Regex: &invalidHeaderRegex},
+								},
+							},
+							TargetModels: []*networkingv1alpha1.TargetModel{
+								{ModelServerName: "test-server"},
+							},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.rules[0].modelMatch.headers[x-user].regex: Invalid value: \"[\": error parsing regexp: missing closing ]: `[`",
+		},
+		{
+			name: "invalid model route - invalid uri regex",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name: "test-rule",
+							ModelMatch: &networkingv1alpha1.ModelMatch{
+								Uri: &networkingv1alpha1.StringMatch{
+									Regex: &invalidURIRegex,
+								},
+							},
+							TargetModels: []*networkingv1alpha1.TargetModel{
+								{ModelServerName: "test-server"},
+							},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.rules[0].modelMatch.uri.regex: Invalid value: \"[\": error parsing regexp: missing closing ]: `[`",
+		},
+		{
+			name: "invalid model route - nil rule",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						nil,
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.rules[0]: Invalid value: null: rule must not be nil",
+		},
+		{
+			name: "invalid model route - combined errors: missing model name and empty targetModels",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name:         "empty-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec: Required value: either modelName or loraAdapters must be specified  - spec.rules[0].targetModels: Required value: each rule must have at least one target model",
+		},
 	}
 
 	// Create a validator instance
 	kubeClient := fake.NewSimpleClientset()
-	modelInferClient := clientset.NewSimpleClientset()
-	validator := NewKthenaRouterValidator(kubeClient, modelInferClient, 8080)
+	validator := NewKthenaRouterValidator(kubeClient, 8080)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

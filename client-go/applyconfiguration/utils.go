@@ -26,7 +26,7 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
-	testing "k8s.io/client-go/testing"
+	managedfields "k8s.io/apimachinery/pkg/util/managedfields"
 )
 
 // ForKind returns an apply configuration type for the given GroupVersionKind, or nil if no
@@ -76,10 +76,6 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationworkloadv1alpha1.AutoscalingPolicyApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("AutoscalingPolicyBehavior"):
 		return &applyconfigurationworkloadv1alpha1.AutoscalingPolicyBehaviorApplyConfiguration{}
-	case workloadv1alpha1.SchemeGroupVersion.WithKind("AutoscalingPolicyBinding"):
-		return &applyconfigurationworkloadv1alpha1.AutoscalingPolicyBindingApplyConfiguration{}
-	case workloadv1alpha1.SchemeGroupVersion.WithKind("AutoscalingPolicyBindingSpec"):
-		return &applyconfigurationworkloadv1alpha1.AutoscalingPolicyBindingSpecApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("AutoscalingPolicyMetric"):
 		return &applyconfigurationworkloadv1alpha1.AutoscalingPolicyMetricApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("AutoscalingPolicyPanicPolicy"):
@@ -90,18 +86,26 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationworkloadv1alpha1.AutoscalingPolicySpecApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("AutoscalingPolicyStablePolicy"):
 		return &applyconfigurationworkloadv1alpha1.AutoscalingPolicyStablePolicyApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("AutoscalingPolicyStatus"):
+		return &applyconfigurationworkloadv1alpha1.AutoscalingPolicyStatusApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("DisaggregatedScalingStatus"):
+		return &applyconfigurationworkloadv1alpha1.DisaggregatedScalingStatusApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("DisaggregatedTarget"):
+		return &applyconfigurationworkloadv1alpha1.DisaggregatedTargetApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("GangPolicy"):
 		return &applyconfigurationworkloadv1alpha1.GangPolicyApplyConfiguration{}
-	case workloadv1alpha1.SchemeGroupVersion.WithKind("LoraAdapter"):
-		return &applyconfigurationworkloadv1alpha1.LoraAdapterApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("HeterogeneousTarget"):
+		return &applyconfigurationworkloadv1alpha1.HeterogeneousTargetApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("HeterogeneousTargetParam"):
+		return &applyconfigurationworkloadv1alpha1.HeterogeneousTargetParamApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("HomogeneousTarget"):
+		return &applyconfigurationworkloadv1alpha1.HomogeneousTargetApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("Metadata"):
 		return &applyconfigurationworkloadv1alpha1.MetadataApplyConfiguration{}
-	case workloadv1alpha1.SchemeGroupVersion.WithKind("MetricEndpoint"):
-		return &applyconfigurationworkloadv1alpha1.MetricEndpointApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("MetricSource"):
+		return &applyconfigurationworkloadv1alpha1.MetricSourceApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("ModelBackend"):
 		return &applyconfigurationworkloadv1alpha1.ModelBackendApplyConfiguration{}
-	case workloadv1alpha1.SchemeGroupVersion.WithKind("ModelBackendStatus"):
-		return &applyconfigurationworkloadv1alpha1.ModelBackendStatusApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("ModelBooster"):
 		return &applyconfigurationworkloadv1alpha1.ModelBoosterApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("ModelBoosterSpec"):
@@ -116,31 +120,41 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationworkloadv1alpha1.ModelStatusApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("ModelWorker"):
 		return &applyconfigurationworkloadv1alpha1.ModelWorkerApplyConfiguration{}
-	case workloadv1alpha1.SchemeGroupVersion.WithKind("OptimizerConfiguration"):
-		return &applyconfigurationworkloadv1alpha1.OptimizerConfigurationApplyConfiguration{}
-	case workloadv1alpha1.SchemeGroupVersion.WithKind("OptimizerParam"):
-		return &applyconfigurationworkloadv1alpha1.OptimizerParamApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("NetworkTopology"):
+		return &applyconfigurationworkloadv1alpha1.NetworkTopologyApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("PluginScope"):
+		return &applyconfigurationworkloadv1alpha1.PluginScopeApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("PluginSpec"):
+		return &applyconfigurationworkloadv1alpha1.PluginSpecApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("PodMetricSource"):
+		return &applyconfigurationworkloadv1alpha1.PodMetricSourceApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("PodTemplateSpec"):
 		return &applyconfigurationworkloadv1alpha1.PodTemplateSpecApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("PrometheusMetricSource"):
+		return &applyconfigurationworkloadv1alpha1.PrometheusMetricSourceApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("Role"):
 		return &applyconfigurationworkloadv1alpha1.RoleApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("RoleRatioConstraint"):
+		return &applyconfigurationworkloadv1alpha1.RoleRatioConstraintApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("RoleRatioStatus"):
+		return &applyconfigurationworkloadv1alpha1.RoleRatioStatusApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("RoleScalingParam"):
+		return &applyconfigurationworkloadv1alpha1.RoleScalingParamApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("RollingUpdateConfiguration"):
 		return &applyconfigurationworkloadv1alpha1.RollingUpdateConfigurationApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("RolloutStrategy"):
 		return &applyconfigurationworkloadv1alpha1.RolloutStrategyApplyConfiguration{}
-	case workloadv1alpha1.SchemeGroupVersion.WithKind("ScalingConfiguration"):
-		return &applyconfigurationworkloadv1alpha1.ScalingConfigurationApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("ServingGroup"):
 		return &applyconfigurationworkloadv1alpha1.ServingGroupApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("Target"):
 		return &applyconfigurationworkloadv1alpha1.TargetApplyConfiguration{}
-	case workloadv1alpha1.SchemeGroupVersion.WithKind("TopologySpreadConstraint"):
-		return &applyconfigurationworkloadv1alpha1.TopologySpreadConstraintApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("TargetScalingStatus"):
+		return &applyconfigurationworkloadv1alpha1.TargetScalingStatusApplyConfiguration{}
 
 	}
 	return nil
 }
 
-func NewTypeConverter(scheme *runtime.Scheme) *testing.TypeConverter {
-	return &testing.TypeConverter{Scheme: scheme, TypeResolver: internal.Parser()}
+func NewTypeConverter(scheme *runtime.Scheme) managedfields.TypeConverter {
+	return managedfields.NewSchemeTypeConverter(scheme, internal.Parser())
 }

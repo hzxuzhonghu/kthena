@@ -9,9 +9,17 @@
 </p>
 
 <p align="center">
-| <a href="#">Documentation</a> | <a href="#">Blog</a> | <a href="#">White Paper</a> | <a href="#">Slack</a> |
+| <a href="https://kthena.volcano.sh/">Documentation</a> | <a href="https://kthena.volcano.sh/blog">Blog</a> | <a href="#">White Paper</a> | <a href="#">Slack</a> |
 
 </p>
+
+<div align="center">
+
+[![Go Check](https://github.com/volcano-sh/kthena/actions/workflows/go-check.yml/badge.svg)](https://github.com/volcano-sh/kthena/actions/workflows/go-check.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/volcano-sh/kthena)](https://goreportcard.com/report/github.com/volcano-sh/kthena)
+![GitHub Release](https://img.shields.io/github/v/release/volcano-sh/kthena?sort=semver)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/volcano-sh/kthena)
+</div>
 
 ## Overview
 
@@ -51,7 +59,7 @@ Kthena implements a Kubernetes-native architecture with separate control plane a
 - **Kthena-router**:
   The data plane entry point for inference traffic. It classifies each request by model name, custom headers, or URI patterns, then applies load-balancing policies and traffic controls to dispatch request to the right inference instance. Native support for prefill–decode disaggregation routing while keeps high throughput and low latency.
 
-For more details, please refer to [Kthena Architecture](docs/kthena/docs/architecture/architecture.mdx)
+For more details, please refer to [Kthena Architecture](https://kthena.volcano.sh/docs/architecture)
 
 > [!Note]
 > The router component is a reference implementation, because Gateway Inference Extension does not natively support prefill-decode distribution. kthena router is still under active iteration, and it can be deployed behind a standard api gateway.
@@ -60,6 +68,16 @@ For more details, please refer to [Kthena Architecture](docs/kthena/docs/archite
 ## Getting Started
 
 Get up and running with Kthena in minutes. This [guide](docs/kthena/docs/getting-started/quick-start.md) will walk you through installing the platform and deploying your first LLM model.
+
+### Install from code
+
+If you don't have a kubernetes cluster, try one-click install from code base:
+
+```bash
+./hack/local-up-kthena.sh
+```
+
+Run `./hack/local-up-kthena.sh --help` for more options.
 
 ## Community
 

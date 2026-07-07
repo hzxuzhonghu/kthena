@@ -2,15 +2,23 @@ apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: ModelServing
 metadata: ${MODEL_SERVING_TEMPLATE_METADATA}
 spec:
-  schedulerName: volcano
+  schedulerName: ${SCHEDULER_NAME}
   replicas: ${BACKEND_REPLICAS}
   template:
     restartGracePeriodSeconds: 60
+    gangPolicy:
+      minRoleReplicas:
+        prefill: ${PREFILL_REPLICAS}
+        decode: ${DECODE_REPLICAS}
     roles:
       - name: prefill
         replicas: ${PREFILL_REPLICAS}
         entryTemplate:
+          metadata: ${SERVER_ENTRY_TEMPLATE_METADATA}
           spec:
+            runtimeClassName: ${RUNTIME_CLASS_NAME}
+            affinity: ${PREFILL_AFFINITY}
+            tolerations: ${PREFILL_TOLERATIONS}
             initContainers: ${INIT_CONTAINERS}
             containers:
               - name: runtime
@@ -47,7 +55,7 @@ spec:
                     path: /health
                     port: 8000
                 livenessProbe:
-                  initialDelaySeconds: 90
+                  initialDelaySeconds: 180
                   periodSeconds: 5
                   failureThreshold: 3
                   httpGet:
@@ -55,15 +63,6 @@ spec:
                     port: 8000
                 volumeMounts: ${VOLUME_MOUNTS}
             volumes: ${VOLUMES}
-            affinity:
-              nodeAffinity:
-                requiredDuringSchedulingIgnoredDuringExecution:
-                  nodeSelectorTerms:
-                    - matchExpressions:
-                        - key: node.kubernetes.io/npu.chip.name
-                          operator: In
-                          values:
-                            - Ascend910
         workerReplicas: 0
         workerTemplate:
           spec:
@@ -71,7 +70,11 @@ spec:
       - name: decode
         replicas: ${DECODE_REPLICAS}
         entryTemplate:
+          metadata: ${SERVER_ENTRY_TEMPLATE_METADATA}
           spec:
+            runtimeClassName: ${RUNTIME_CLASS_NAME}
+            affinity: ${DECODE_AFFINITY}
+            tolerations: ${DECODE_TOLERATIONS}
             initContainers: ${INIT_CONTAINERS}
             containers:
               - name: runtime
@@ -109,22 +112,13 @@ spec:
                     path: /health
                     port: 8000
                 livenessProbe:
-                  initialDelaySeconds: 90
+                  initialDelaySeconds: 180
                   periodSeconds: 5
                   failureThreshold: 3
                   httpGet:
                     path: /health
                     port: 8000
                 volumeMounts: ${VOLUME_MOUNTS}
-            affinity:
-              nodeAffinity:
-                requiredDuringSchedulingIgnoredDuringExecution:
-                  nodeSelectorTerms:
-                    - matchExpressions:
-                        - key: node.kubernetes.io/npu.chip.name
-                          operator: In
-                          values:
-                            - Ascend910
             volumes: ${VOLUMES}
         workerReplicas: 0
         workerTemplate:

@@ -1,57 +1,126 @@
 workload:
-  # enabled is a flag to enable or disable the workload subchart. Default is true.
+  # -- Enable the workload subchart.
   enabled: true
   controllerManager:
+    image:
+      # -- Image repository for the Controller Manager.
+      repository: ghcr.io/volcano-sh/kthena-controller-manager
+      # -- Image tag for the Controller Manager.
+      tag: latest
+      # -- Image pull policy for the Controller Manager.
+      pullPolicy: IfNotPresent
+    # -- Debug server port for Controller Manager (set 0 to disable).
+    debugPort: 0
+    downloaderImage:
+      # -- Image repository for the Downloader.
+      repository: ghcr.io/volcano-sh/downloader
+      # -- Image tag for the Downloader.
+      tag: latest
+    runtimeImage:
+      # -- Image repository for the Runtime.
+      repository: ghcr.io/volcano-sh/runtime
+      # -- Image tag for the Runtime.
+      tag: latest
     webhook:
+      # -- Enable webhook for the Controller Manager.
       enabled: true
+      tls:
+        # -- Secret name for storing webhook certificates.
+        certSecretName: kthena-controller-manager-webhook-certs
+        # -- Service name for the webhook.
+        serviceName: kthena-controller-manager-webhook
 
 networking:
-  # enabled is a flag to enable or disable the networking subchart. Default is true.
+  # -- Enable the networking subchart.
   enabled: true
   kthenaRouter:
+    # -- Enable Kthena Router.
     enabled: true
+    # -- Container port for Kthena Router.
     port: 8080
+    # -- Debug server port for Kthena Router (localhost only).
+    debugPort: 15000
+    image:
+      # -- Image repository for Kthena Router.
+      repository: ghcr.io/volcano-sh/kthena-router
+      # -- Image tag for Kthena Router.
+      tag: latest
+      # -- Image pull policy for Kthena Router.
+      pullPolicy: IfNotPresent
     tls:
+      # -- Enable TLS for Kthena Router server.
       enabled: false
-      # The DNS name to use for the certificate.
+      # -- DNS name to use for the certificate.
       dnsName: "your-domain.com"
-      # The name of the secret to store the certificate and key.
+      # -- Secret name to store the certificate and key.
       secretName: "kthena-router-tls"
     webhook:
+      # -- Enable webhook for Kthena Router.
       enabled: true
+      # -- Container port for Kthena Router webhook.
       port: 8443
+      # -- Service port for Kthena Router webhook.
       servicePort: 443
       tls:
-        certFile: /etc/webhook/certs/tls.crt
-        keyFile: /etc/webhook/certs/tls.key
+        # -- Certificate file path for the webhook.
+        certFile: /etc/tls/tls.crt
+        # -- Key file path for the webhook.
+        keyFile: /etc/tls/tls.key
+        # -- Secret name for storing webhook certificates.
         secretName: kthena-router-webhook-certs
-      autoCreateSecret: false
-      caBundle: ""
-    # fairness configuration for request scheduling
+    # fairness configures the per-model user-fairness queue, which orders requests
+    # by each user's recent token usage. It is mutually exclusive with sessionBoost.
     fairness:
-      # enabled controls whether fairness scheduling is active
+      # -- Enable user-fairness scheduling. Mutually exclusive with sessionBoost.
       enabled: false
-      # windowSize is the sliding window duration for token usage tracking
+      # -- User-fairness strategy: sliding window duration for token usage tracking.
       windowSize: "1h"
-      # inputTokenWeight is the weight multiplier for input tokens
+      # -- User-fairness strategy: weight multiplier for input tokens.
       inputTokenWeight: 1.0
-      # outputTokenWeight is the weight multiplier for output tokens
+      # -- User-fairness strategy: weight multiplier for output tokens.
       outputTokenWeight: 2.0
-  webhook:
-    enabled: true
+      # -- Global total inflight request limit admitted through the fairness gate.<br/>
+      # `0` or unset falls back to QPS-based rate limiting.
+      maxConcurrent: 0
+    # sessionBoost configures session-aware boosting to maximize prefix cache hits
+    # for multi-turn conversations. It is mutually exclusive with fairness.
+    sessionBoost:
+      # -- Enable session-boost scheduling. Mutually exclusive with fairness.
+      enabled: false
+      # -- HTTP header used to identify conversation sessions.
+      header: "X-Session-ID"
+      # -- Maximum number of recently-completed sessions kept warm for boosting.<br/>
+      # Bounds an LRU cache; the least-recently-used session is evicted automatically.<br/>
+      # Size it by the number of concurrent conversations to keep boosted.
+      maxSessions: 4096
+      # -- Maximum inflight requests admitted per backend pod.<br/>
+      # Total inflight limit is this value times the number of backend pods.<br/>
+      # `0` or unset uses the router default (16).
+      inflightPerPod: 16
+      # -- Wait time after a request completes for a same-session follow-up.<br/>
+      # Disabled by default (`0s`).
+      gracePeriod: "0s"
+    gatewayAPI:
+      # -- Enable Gateway API related features.
+      enabled: false
+      # -- Enable Gateway API Inference Extension features.<br/>
+      # Requires `gatewayAPI.enabled` to be true.
+      inferenceExtension: false
+    # -- The router will drain all in-flight requests before forcefully closing connections.
+    terminationGracePeriodSeconds: 330
+    # -- Drain timeout for kthena-router graceful shutdown.
+    # -- This should be less than terminationGracePeriodSeconds.
+    drainTimeout: 5m
 
 global:
-  certManager:
-    # Enable or disable cert-manager integration for all subcharts.
-    # If set to true, this chart will attempt to create cert-manager resources (Issuer, Certificate, etc.)
-    # for all components that support it (e.g., admission webhooks).
-    #
-    # IMPORTANT:
-    # - cert-manager must be installed in your cluster before enabling this option.
-    #   See: https://cert-manager.io/docs/installation/
-    enabled: true
+  # -- Certificate Management Mode.<br/>
+  #  Three mutually exclusive options for managing TLS certificates:<br/>
+  #  - `auto`: Webhook servers generate self-signed certificates automatically.<br/>
+  #  - `cert-manager`: Use cert-manager to generate and manage certificates (requires cert-manager installation).<br/>
+  #  - `manual`: Provide your own certificates via caBundle.
+  certManagementMode: auto
   webhook:
-    # caBundle is the base64-encoded CA bundle for webhook server certificates.
-    # This is required when cert-manager is disabled (global.certManager.enabled=false).
-    # You can generate it with: cat /path/to/your/ca.crt | base64 | tr -d '\n'
-    # caBundle: ""
+    # -- CA bundle for webhook server certificates (base64-encoded).<br/>
+    # This is ONLY required when `certManagementMode` is set to "manual".<br/>
+    # You can generate it with: `cat /path/to/your/ca.crt | base64 | tr -d '\n'`<br/>
+    caBundle: ""

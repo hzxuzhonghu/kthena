@@ -1,7 +1,7 @@
 pluginConfig:
 - name: least-request
-  args: 
-    maxWaitingRequests: 10
+    args:
+      maxWaitingRequests: 10
 - name: least-latency
   args:
     TTFTTPOTWeightFactor: 0.5
@@ -10,6 +10,7 @@ pluginConfig:
     blockSizeToHash: 64
     maxBlocksToMatch: 128
     maxHashCacheSize: 50000
+    topKMatches: 5
 plugins:
   Filter:
     enabled:
@@ -18,11 +19,11 @@ plugins:
       - lora-affinity
   Score:
     enabled:
-      - name: least-request
-        weight: 1
-      - name: gpu-usage
-        weight: 1
-      - name: least-latency
-        weight: 1
-      - name: prefix-cache
-        weight: 1
+    - name: least-request
+      weight: 1
+    - name: gpu-usage
+      weight: 1
+    - name: least-latency
+      weight: 1
+    - name: prefix-cache
+      weight: 1
