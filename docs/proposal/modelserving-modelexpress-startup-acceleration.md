@@ -38,7 +38,7 @@ Weight loading dominates bootstrap of large models on initial deployment, scale-
 
 #### Non-Goals
 
-- Deploying MX or its metadata backend, or configuring the engine (`--load-format modelexpress`, MX tuning variables). The controller only injects the MX endpoint, the source readiness URL, and Pod identity/address variables (see [Environment injection](#environment-injection)).
+- Deploying MX or its metadata backend, or configuring the engine (`--load-format modelexpress`, MX tuning variables). The controller only injects the MX endpoint, the source readiness URL, and the worker address (see [Environment injection](#environment-injection)).
 - Calling MX APIs from the controller. A Running role replica is treated as a source.
 - Choosing the load path. MX's fallback chain (P2P → cache → storage → native loader) does that.
 - ModelBooster integration, and cross-role or cross-layout sources.
@@ -320,7 +320,7 @@ Storage serves 3 cold loads instead of 24.
 
 **R3. Outdated replicas** already exist and are not affected. Missing partition-protected ordinals are re-created from their ControllerRevision and admitted in their old pool.
 
-**R4. Deleting sources.** A replica pulling from a deleted source retries another candidate (MX tries up to 3) and then falls back to storage. On clean shutdown MX marks the source `STALE`, and with the Kubernetes backend its metadata is garbage-collected through the Pod owner reference.
+**R4. Deleting sources.** A replica pulling from a deleted source retries another candidate (MX tries up to 3) and then falls back to storage. On clean shutdown MX marks the source `STALE`, and the MX server's reaper removes stale metadata from its backend (Redis).
 
 **R5. Rollback.** Reverting to a template and effective configuration whose hashes still have Running replicas resolves to that pool, so re-created replicas are admitted with $R > 0$ immediately.
 
@@ -377,7 +377,7 @@ MX client defaults already suit this topology and are not injected: an empty `MX
 
 Pod IP is a sensible default for `MX_WORKER_HOST`, not a guarantee of RDMA reachability. Users must override it when the advertised address needs another interface. NetworkPolicy and the GPU/RDMA device allocation must permit the worker gRPC/NIXL port ranges and data-plane traffic. Multiple engines sharing one Pod network, or host-network Pods sharing a node, need nonoverlapping port ranges; Kthena does not allocate those automatically.
 
-**Configuration ownership.** Keep workload-specific values in `modelExpress` or the selected engine container's template, not controller arguments. The `serverAddress`, `readyURL`, and `engineContainers` fields suffice; Pod identity/IP are derived and MX supplies stable port defaults. Custom ports, `MX_NIXL_BACKEND` (`UCX` for InfiniBand/RoCE, `LIBFABRIC` for AWS EFA), NIC pinning, source selection, and timeouts can be set explicitly in the engine container's `env`. No controller-wide flags or arbitrary env passthrough API are needed.
+**Configuration ownership.** Keep workload-specific values in `modelExpress` or the selected engine container's template, not controller arguments. The `serverAddress`, `readyURL`, and `engineContainers` fields suffice; the Pod IP is derived and MX supplies stable port defaults. Custom ports, `MX_NIXL_BACKEND` (`UCX` for InfiniBand/RoCE, `LIBFABRIC` for AWS EFA), NIC pinning, source selection, and timeouts can be set explicitly in the engine container's `env`. No controller-wide flags or arbitrary env passthrough API are needed.
 
 Do not guess a model revision or compile-cache digest from the ModelServing revision hash. Leave `MX_MODEL_REVISION` to the engine or an explicit checkpoint-version override; it labels source identity and does not pin the engine's checkpoint. Artifact transfer is opt-in: users setting `MX_ARTIFACT_TRANSFER=1` should also supply distinct `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` values for incompatible prefill/decode compilation settings. `VLLM_PLUGINS=modelexpress` is needed only for vLLM older than 0.23, not injected universally. The decentralized `k8s-service` backend needs its own Service/rank routing and pinned source identity, so it is outside this central-server integration.
 
