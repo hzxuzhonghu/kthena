@@ -137,8 +137,10 @@ func TestConfigHash(t *testing.T) {
 			wantSame: true,
 		},
 		{
-			name:     "readyURL",
-			mutate:   func(ms *workloadv1alpha1.ModelServing) { ms.Spec.BootstrapAccelerateStrategy.ModelExpress.ReadyURL = "" },
+			name: "readyURL",
+			mutate: func(ms *workloadv1alpha1.ModelServing) {
+				ms.Spec.BootstrapAccelerateStrategy.ModelExpress.ReadyURL = ""
+			},
 			wantSame: true,
 		},
 		{
@@ -155,8 +157,10 @@ func TestConfigHash(t *testing.T) {
 			wantSame: true,
 		},
 		{
-			name:   "server address",
-			mutate: func(ms *workloadv1alpha1.ModelServing) { ms.Spec.BootstrapAccelerateStrategy.ModelExpress.ServerAddress = "mx2:8001" },
+			name: "server address",
+			mutate: func(ms *workloadv1alpha1.ModelServing) {
+				ms.Spec.BootstrapAccelerateStrategy.ModelExpress.ServerAddress = "mx2:8001"
+			},
 		},
 		{
 			name: "engine containers",
@@ -169,8 +173,10 @@ func TestConfigHash(t *testing.T) {
 			mutate: func(ms *workloadv1alpha1.ModelServing) { ms.Spec.BootstrapAccelerateStrategy.ModelExpress = nil },
 		},
 		{
-			name:   "scope",
-			mutate: func(ms *workloadv1alpha1.ModelServing) { ms.Spec.BootstrapAccelerateStrategy.Roles = []string{"decode"} },
+			name: "scope",
+			mutate: func(ms *workloadv1alpha1.ModelServing) {
+				ms.Spec.BootstrapAccelerateStrategy.Roles = []string{"decode"}
+			},
 		},
 		{
 			name:   "plugin config",

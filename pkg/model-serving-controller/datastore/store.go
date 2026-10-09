@@ -47,6 +47,8 @@ type Store interface {
 	AddRunningPodToServingGroup(modelServingName types.NamespacedName, groupName, pod, revision, roleTemplateHash, roleName, roleID string)
 	// AddServingGroupAndRole adds servingGroup and role if not exist
 	AddServingGroupAndRole(modelServingName types.NamespacedName, servingGroupName, revision, roleTemplateHash, roleName, roleID string)
+	// ObserveRoleBootstrapConfigHash records the bootstrap-configuration hash of one Pod of an existing role.
+	ObserveRoleBootstrapConfigHash(modelServingName types.NamespacedName, groupName, roleName, roleID, hash string)
 	DeleteRunningPodFromServingGroup(modelServingName types.NamespacedName, groupName string, pod string)
 	UpdateServingGroupStatus(modelServingName types.NamespacedName, groupName string, Status ServingGroupStatus) error
 	UpdateServingGroupRevision(modelServingName types.NamespacedName, groupName string, revision string) error
@@ -75,6 +77,11 @@ type Role struct {
 	Revision         string // Revision of the ServingGroup
 	RoleTemplateHash string // Revision of the Role, used for RoleRollingUpdate strategy
 	Status           RoleStatus
+	// BootstrapConfigHash is the bootstrap-configuration hash shared by all observed Pods of the role.
+	// It is empty when any Pod lacks the hash or the Pods disagree.
+	BootstrapConfigHash string
+	// bootstrapConfigHashObserved reports whether any Pod of the role has been observed.
+	bootstrapConfigHashObserved bool
 }
 
 type ServingGroupStatus string
@@ -457,6 +464,28 @@ func (s *store) AddServingGroupAndRole(modelServingName types.NamespacedName, se
 			RoleTemplateHash: roleTemplateHash,
 		}
 		group.roles[roleName][roleID] = role
+	}
+}
+
+// ObserveRoleBootstrapConfigHash records the bootstrap-configuration hash of one Pod
+// of an existing role. A Pod without the hash or with a different hash clears it.
+func (s *store) ObserveRoleBootstrapConfigHash(modelServingName types.NamespacedName, groupName, roleName, roleID, hash string) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	group, ok := s.servingGroup[modelServingName][groupName]
+	if !ok {
+		return
+	}
+	role, ok := group.roles[roleName][roleID]
+	if !ok {
+		return
+	}
+	if !role.bootstrapConfigHashObserved {
+		role.BootstrapConfigHash = hash
+		role.bootstrapConfigHashObserved = true
+	} else if role.BootstrapConfigHash != hash {
+		role.BootstrapConfigHash = ""
 	}
 }
 

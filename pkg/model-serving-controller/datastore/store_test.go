@@ -315,6 +315,57 @@ func TestAddRole(t *testing.T) {
 	assert.Equal(t, "revision1", role4.Revision, "existing role should not be overwritten")
 }
 
+func TestObserveRoleBootstrapConfigHash(t *testing.T) {
+	key := types.NamespacedName{Namespace: "ns1", Name: "model1"}
+	tests := []struct {
+		name     string
+		observed []string
+		want     string
+	}{
+		{name: "no pods observed", want: ""},
+		{name: "all pods match", observed: []string{"h1", "h1", "h1"}, want: "h1"},
+		{name: "pod without hash", observed: []string{"h1", ""}, want: ""},
+		{name: "first pod without hash", observed: []string{"", "h1"}, want: ""},
+		{name: "pods disagree", observed: []string{"h1", "h2"}, want: ""},
+		{name: "mismatch is sticky", observed: []string{"h1", "h2", "h1", "h1"}, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New()
+			s.AddRole(key, "group0", "prefill", "prefill-0", "revision1", "roleRevision1")
+			for _, hash := range tt.observed {
+				s.ObserveRoleBootstrapConfigHash(key, "group0", "prefill", "prefill-0", hash)
+			}
+			roles, err := s.GetRoleList(key, "group0", "prefill")
+			assert.NoError(t, err)
+			assert.Len(t, roles, 1)
+			assert.Equal(t, tt.want, roles[0].BootstrapConfigHash)
+		})
+	}
+
+	t.Run("missing role is ignored", func(t *testing.T) {
+		s := New()
+		s.ObserveRoleBootstrapConfigHash(key, "group0", "prefill", "prefill-0", "h1")
+		s.AddRole(key, "group0", "prefill", "prefill-0", "revision1", "roleRevision1")
+		s.ObserveRoleBootstrapConfigHash(key, "group0", "decode", "decode-0", "h1")
+		roles, err := s.GetRoleList(key, "group0", "prefill")
+		assert.NoError(t, err)
+		assert.Equal(t, "", roles[0].BootstrapConfigHash)
+	})
+
+	t.Run("re-created role starts fresh", func(t *testing.T) {
+		s := New()
+		s.AddRole(key, "group0", "prefill", "prefill-0", "revision1", "roleRevision1")
+		s.ObserveRoleBootstrapConfigHash(key, "group0", "prefill", "prefill-0", "")
+		s.DeleteRole(key, "group0", "prefill", "prefill-0")
+		s.AddRole(key, "group0", "prefill", "prefill-0", "revision1", "roleRevision1")
+		s.ObserveRoleBootstrapConfigHash(key, "group0", "prefill", "prefill-0", "h1")
+		roles, err := s.GetRoleList(key, "group0", "prefill")
+		assert.NoError(t, err)
+		assert.Equal(t, "h1", roles[0].BootstrapConfigHash)
+	})
+}
+
 func TestGetServingGroupByModelServingSortingByIndex(t *testing.T) {
 	key := types.NamespacedName{Namespace: "ns1", Name: "model1"}
 
