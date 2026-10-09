@@ -55,6 +55,7 @@ import (
 	informersv1alpha1 "github.com/volcano-sh/kthena/client-go/informers/externalversions"
 	listerv1alpha1 "github.com/volcano-sh/kthena/client-go/listers/workload/v1alpha1"
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/model-serving-controller/bootstrap"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/plugins"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/podgroupmanager"
@@ -2692,13 +2693,13 @@ func (c *ModelServingController) syncHeadlessServices(ctx context.Context, ms *w
 }
 
 func (c *ModelServingController) buildPluginChain(ms *workloadv1alpha1.ModelServing) (*plugins.Chain, error) {
-	if ms == nil || len(ms.Spec.Plugins) == 0 {
+	if ms == nil || (len(ms.Spec.Plugins) == 0 && !bootstrap.Enabled(ms)) {
 		return nil, nil
 	}
 	if c.pluginsRegistry == nil {
 		return nil, fmt.Errorf("plugin registry is not initialized")
 	}
-	return plugins.NewChain(c.pluginsRegistry, ms.Spec.Plugins)
+	return plugins.NewChainForModelServing(c.pluginsRegistry, ms)
 }
 
 func (c *ModelServingController) CreatePodsForServingGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupIndex int, revision string, roles []workloadv1alpha1.Role) error {
