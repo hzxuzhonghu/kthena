@@ -358,6 +358,9 @@ func (c *ModelServingController) updatePod(_, newObj interface{}) {
 		return
 	}
 
+	// Record the hash before readiness handling so a ready replica is never judged on a stale hash.
+	c.observePodBootstrapConfigHash(ms, servingGroupName, newPod)
+
 	switch {
 	case utils.IsPodRunningAndReady(newPod):
 		klog.V(4).Infof("handleReadyPod: %s/%s", newPod.Namespace, newPod.Name)
@@ -383,8 +386,13 @@ func (c *ModelServingController) updatePod(_, newObj interface{}) {
 			}, servingGroupName, utils.ObjectRevision(newPod), roleTemplateHash, roleName, utils.GetRoleID(newPod))
 		}
 	}
-	c.store.ObserveRoleBootstrapConfigHash(utils.GetNamespaceName(ms), servingGroupName, utils.GetRoleName(newPod), utils.GetRoleID(newPod),
-		newPod.Annotations[workloadv1alpha1.BootstrapConfigHashAnnotationKey])
+	// Observe again in case the handling above created the role.
+	c.observePodBootstrapConfigHash(ms, servingGroupName, newPod)
+}
+
+func (c *ModelServingController) observePodBootstrapConfigHash(ms *workloadv1alpha1.ModelServing, servingGroupName string, pod *corev1.Pod) {
+	c.store.ObserveRoleBootstrapConfigHash(utils.GetNamespaceName(ms), servingGroupName, utils.GetRoleName(pod), utils.GetRoleID(pod),
+		pod.Name, pod.Annotations[workloadv1alpha1.BootstrapConfigHashAnnotationKey])
 }
 
 func (c *ModelServingController) deletePod(obj interface{}) {
@@ -413,6 +421,7 @@ func (c *ModelServingController) deletePod(obj interface{}) {
 
 	// Remove the pod from running pods in the store
 	c.store.DeleteRunningPodFromServingGroup(utils.GetNamespaceName(ms), servingGroupName, pod.Name)
+	c.store.ForgetRoleBootstrapConfigHash(utils.GetNamespaceName(ms), servingGroupName, roleName, roleID, pod.Name)
 
 	// skip handling if pod revision mismatches serving group revision or owner mismatch
 	if c.shouldSkipHandling(ms, servingGroupName, pod) {
@@ -2910,7 +2919,12 @@ func (c *ModelServingController) createRoleReplicas(ctx context.Context, ms *wor
 		}
 		c.store.AddRole(utils.GetNamespaceName(ms), servingGroupName, replica.role.Name, roleID, replica.revision, replica.roleTemplateHash)
 		for _, p := range rendered[i] {
-			c.store.ObserveRoleBootstrapConfigHash(utils.GetNamespaceName(ms), servingGroupName, replica.role.Name, roleID, p.pod.Annotations[workloadv1alpha1.BootstrapConfigHashAnnotationKey])
+			// Prefer an already existing Pod's hash over the rendered one.
+			pod := p.pod
+			if existing, err := c.podsLister.Pods(ms.Namespace).Get(pod.Name); err == nil {
+				pod = existing
+			}
+			c.store.ObserveRoleBootstrapConfigHash(utils.GetNamespaceName(ms), servingGroupName, replica.role.Name, roleID, pod.Name, pod.Annotations[workloadv1alpha1.BootstrapConfigHashAnnotationKey])
 		}
 		// Emit event for new role entering Creating state
 		message := fmt.Sprintf("Role %s/%s in ServingGroup %s is now Creating", replica.role.Name, roleID, servingGroupName)

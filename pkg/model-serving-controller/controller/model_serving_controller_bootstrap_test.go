@@ -264,7 +264,7 @@ func TestBootstrapGangCoreDeficit(t *testing.T) {
 				groupName := utils.GenerateServingGroupName(ms.Name, groupOrdinal)
 				roleID := utils.GenerateRoleID("decode", roleOrdinal)
 				c.store.AddRole(key, groupName, "decode", roleID, revision, roleHash)
-				c.store.ObserveRoleBootstrapConfigHash(key, groupName, "decode", roleID, configHash)
+				c.store.ObserveRoleBootstrapConfigHash(key, groupName, "decode", roleID, groupName+"-"+roleID, configHash)
 			}
 			c.store.AddServingGroup(key, 0, revision)
 			addRole(0, 0)
@@ -296,6 +296,41 @@ func TestBootstrapGangCoreDeficit(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBootstrapPodEventsTrackConfigHash(t *testing.T) {
+	c, kubeClient, _ := newBootstrapTestController(t, false)
+	ms := bootstrapTestModelServing(1, &workloadv1alpha1.BootstrapAccelerateStrategy{}, bootstrapTestRole("decode", 1))
+	ms.Spec.RecoveryPolicy = workloadv1alpha1.NoneRestartPolicy
+	require.NoError(t, c.modelServingsInformer.GetIndexer().Add(ms))
+	syncBootstrapReplicas(t, c, ms)
+
+	wantHash, err := bootstrap.ConfigHash(ms, "decode")
+	require.NoError(t, err)
+	pods, err := kubeClient.CoreV1().Pods(ms.Namespace).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, pods.Items, 1)
+	pod := &pods.Items[0]
+	roleHash := func() string {
+		roles, err := c.store.GetRoleList(utils.GetNamespaceName(ms), utils.GenerateServingGroupName(ms.Name, 0), "decode")
+		require.NoError(t, err)
+		require.Len(t, roles, 1)
+		return roles[0].BootstrapConfigHash
+	}
+	withHash := func(hash string) *corev1.Pod {
+		p := pod.DeepCopy()
+		p.Annotations[workloadv1alpha1.BootstrapConfigHashAnnotationKey] = hash
+		return p
+	}
+
+	assert.Equal(t, wantHash, roleHash())
+	c.updatePod(nil, withHash("other"))
+	assert.Equal(t, "other", roleHash())
+	c.deletePod(withHash("other"))
+	assert.Equal(t, "", roleHash())
+	// The replacement Pod restores the hash of the retained role.
+	c.updatePod(nil, withHash(wantHash))
+	assert.Equal(t, wantHash, roleHash())
 }
 
 func TestBootstrapRenderFailureCreatesNothing(t *testing.T) {
