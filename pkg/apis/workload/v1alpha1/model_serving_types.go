@@ -143,7 +143,7 @@ type ModelExpressConfig struct {
 	// publishes its metadata; it may differ from the Pod readiness probe.
 	// It is injected as MX_ARTIFACT_READY_URL only if that variable is not already
 	// set in the selected container. If empty, ModelExpress uses the engine default.
-	// +kubebuilder:validation:XValidation:rule="isURL(self) && url(self).getScheme() in ['http', 'https']",message="readyURL must be an absolute http or https URL"
+	// +kubebuilder:validation:XValidation:rule="self == '' || (isURL(self) && url(self).getScheme() in ['http', 'https'])",message="readyURL must be an absolute http or https URL"
 	// +optional
 	ReadyURL string `json:"readyURL,omitempty"`
 }

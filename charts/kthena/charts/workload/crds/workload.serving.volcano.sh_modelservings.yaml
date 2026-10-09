@@ -85,7 +85,8 @@ spec:
                         type: string
                         x-kubernetes-validations:
                         - message: readyURL must be an absolute http or https URL
-                          rule: isURL(self) && url(self).getScheme() in ['http', 'https']
+                          rule: self == '' || (isURL(self) && url(self).getScheme()
+                            in ['http', 'https'])
                       serverAddress:
                         description: |-
                           ServerAddress is the ModelExpress server's gRPC address (host:port).
