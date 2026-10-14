@@ -19,7 +19,7 @@ When many ModelServing replicas start together, every role replica loads the ful
 
 This proposal adds an optional `spec.bootstrapAccelerateStrategy` to ModelServing. Instead of creating every role replica at once, the controller creates them in source-aware batches:
 
-- While a pool has no ready replica, it creates a first batch of up to `seedReplicas` role replicas. They find no source, so they load from storage and then become MX sources.
+- While a pool has no ready replica, it creates a first batch of up to the role's `initialSeedReplicas` role replicas. They find no source, so they load from storage and then become MX sources.
 - Once replicas are ready, it creates the rest in batches of up to `sourceFanOut` per ready replica. They pull weights P2P from the ready replicas.
 
 All replicas are identical: each one tries P2P first and falls back to storage. The controller only decides **when** to create them.
@@ -89,7 +89,7 @@ sequenceDiagram
 
 ##### Story 1
 
-Initial deployment of 32 replicas with `seedReplicas: 2` and `sourceFanOut: 2`. The created role replicas go 2 → 6 → 18 → 32, and storage serves 2 cold loads instead of 32.
+Initial deployment of 32 single-role replicas with `roles: [{name: prefill, initialSeedReplicas: 2}]` and `sourceFanOut: 2`. The created role replicas go 2 → 6 → 18 → 32, and storage serves 2 cold loads instead of 32.
 
 ##### Story 2
 
@@ -112,7 +112,7 @@ Rolling update of the engine image on 32 replicas. The first new-revision replic
 |---|---|
 | A first-batch replica never becomes Ready (unschedulable, or crash-looping) and stalls its pool. | Failed replicas are re-created by the recovery policy and re-admitted. An unschedulable replica would block the fleet without the feature too. Events and V(4) logs make it visible. Removing the policy creates everything on the next reconcile. |
 | Between batches, other workloads take the capacity that later batches need. | Same as any scale-up; reserve capacity with a Volcano queue or quota. |
-| `seedReplicas` is smaller than a group's gang requirement. | The controller raises $S$ and $K$ to at least $g$ at runtime, so a gang unit always fits eventually. See [Fan-out and gang](#fan-out-and-gang). |
+| A role's `initialSeedReplicas` is smaller than its gang requirement. | The controller raises $S$ and $K$ to at least $g$ at runtime, so a gang unit always fits eventually. See [Fan-out and gang](#fan-out-and-gang). |
 | MX known issue (nvbug 6519532): a source may stop serving new readers after one of its readers is deleted. Rolling update and scale-down delete readers. | Affected replicas stall until `MX_TRANSFER_TIMEOUT`, then try another source or fall back to storage. Admission bounds concurrent fallbacks to $K$. Document a lower `MX_TRANSFER_TIMEOUT`. |
 | Controller downgrade | Safe: an old controller simply creates the missing replicas. |
 | Security | No new privileges or RBAC. In-scope Pods get plain/downward-API environment variables and a configuration-hash annotation; the MX address is user-supplied. |
@@ -149,24 +149,17 @@ type BootstrapAccelerateStrategy struct {
 	// +optional
 	Provider BootstrapAccelerateStrategyProvider `json:"provider,omitempty"`
 
-	// Roles limits bootstrap acceleration to the listed roles. Empty means all roles.
-	// +listType=set
+	// Roles limits bootstrap acceleration to the listed roles and configures each of them.
+	// Empty means all roles with default settings.
+	// +listType=map
+	// +listMapKey=name
 	// +optional
-	Roles []string `json:"roles,omitempty"`
+	Roles []BootstrapRole `json:"roles,omitempty"`
 
-	// SeedReplicas is the number of role replicas per role that may be created while no
-	// ready source exists. A percentage is taken of the desired role replicas
-	// (spec.replicas * role.replicas) and rounded up, e.g. 10% of 3 is 1.
-	// With gang scheduling, the effective budget is at least the role's minRoleReplicas
-	// (default: all role replicas in one ServingGroup). Must resolve to at least 1
-	// when the desired count is nonzero; a desired count of zero creates nothing.
-	// +kubebuilder:validation:XIntOrString
-	// +kubebuilder:default=1
-	// +optional
-	SeedReplicas *intstr.IntOrString `json:"seedReplicas,omitempty"`
-
-	// SourceFanOut is the number of role replicas per role that may be starting
-	// (created but not yet Running) for each ready replica of the same role.
+	// SourceFanOut is the number of P2P targets that one source can serve, i.e. starting
+	// role replicas (created but not yet Running) per ready replica of the same role.
+	// Once a role replica becomes ready, it acts as a new source for the other replicas
+	// of that role, so the budget grows as more replicas become ready.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
 	// +optional
@@ -176,6 +169,22 @@ type BootstrapAccelerateStrategy struct {
 	// environment variables are injected and users configure the engine themselves.
 	// +optional
 	ModelExpress *ModelExpressConfig `json:"modelExpress,omitempty"`
+}
+
+// BootstrapRole configures bootstrap acceleration for one role.
+type BootstrapRole struct {
+	// Name is the name of a role in spec.template.roles.
+	Name string `json:"name"`
+
+	// InitialSeedReplicas is the number of this role's replicas that may be created while
+	// no ready source exists for it. A percentage is taken of the desired role replicas
+	// (spec.replicas * role.replicas) and rounded up, e.g. 10% of 3 is 1.
+	// With gang scheduling, the effective budget is at least the role's minRoleReplicas
+	// (default: all role replicas in one ServingGroup). A desired count of zero creates nothing.
+	// +kubebuilder:validation:XIntOrString
+	// +kubebuilder:default=1
+	// +optional
+	InitialSeedReplicas *intstr.IntOrString `json:"initialSeedReplicas,omitempty"`
 }
 
 // ModelExpressConfig holds values injected into the Pods of in-scope roles.
@@ -205,8 +214,9 @@ type ModelExpressConfig struct {
 spec:
   replicas: 16
   bootstrapAccelerateStrategy:
-    roles: ["prefill"]
-    seedReplicas: 1
+    roles:
+    - name: prefill
+      initialSeedReplicas: 1
     sourceFanOut: 2
     modelExpress:
       engineContainers: ["engine"]
@@ -226,7 +236,7 @@ spec:
               httpGet: {path: /health, port: 8000}
 ```
 
-**Validation** ([validateModelServing](../../pkg/model-serving-controller/webhook/validator.go#L82)): `roles` must name existing roles; `seedReplicas` is a positive integer or `1%`–`100%`, with percentages rounded up; `sourceFanOut` ≥ 1 is enforced by the CRD schema. A seed count below the gang minimum is accepted and raised to $g$ at runtime, including the default of 1 (see [Fan-out and gang](#fan-out-and-gang)). `modelExpress.serverAddress`, if set, must be `host:port`; `modelExpress.readyURL`, if set, must be an absolute `http` or `https` URL. The field is mutable and takes effect on the next reconcile.
+**Validation** ([validateModelServing](../../pkg/model-serving-controller/webhook/validator.go#L82)): each `roles[].name` must name an existing role, and names are unique (enforced by the list-map schema); each `roles[].initialSeedReplicas` is a positive integer or `1%`–`100%`, with percentages rounded up; `sourceFanOut` ≥ 1 is enforced by the CRD schema. A seed count below the gang minimum is accepted and raised to $g$ at runtime, including the default of 1 (see [Fan-out and gang](#fan-out-and-gang)). `modelExpress.serverAddress`, if set, must be `host:port`; `modelExpress.readyURL`, if set, must be an absolute `http` or `https` URL. The field is mutable and takes effect on the next reconcile.
 
 **Revision neutrality.** `ModelServingRevision` hashes roles; `CalRoleTemplateHash` hashes one role; `BuildRevisionData` captures roles, `schedulerName`, and user `plugins`. None includes `BootstrapAccelerateStrategy`. MX variables and the configuration annotation are added to generated Pods, not to the templates, so they do not change these revision inputs. Unit tests lock this in.
 
@@ -236,53 +246,59 @@ The automatically enabled MX plugin is not written into `spec.plugins` or the Co
 
 #### 2. Admission
 
-Admission runs per **pool** = (role name, role template hash, effective bootstrap-configuration hash). A missing replica's role template comes from the spec, or from the ControllerRevision for partition-protected ordinals.
+##### Pools
 
-**Configuration identity.** A shared pure helper calculates a versioned hash of the role's bootstrap rendering inputs: provider, whether the role is in scope, `modelExpress.serverAddress`, the sorted `modelExpress.engineContainers` selection, and the ordered user-plugin configuration and scope used to render its Pods. Entry and worker templates, including endpoint-alias overrides in `env` and `envFrom`, are already covered by the role template hash. Canonicalize plugin defaults and JSON keys while preserving plugin execution order. Hashing the endpoint and plugin configuration conservatively prevents edits from reusing sources even when `CalRoleTemplateHash` is unchanged; an overridden endpoint may cause an unnecessary seed batch, but never false source reuse. The cost is that any effective plugin configuration change, even one unrelated to MX, restarts the pool with a seed batch. Seed count, fan-out, replica counts, `modelExpress.readyURL` (it changes when a source publishes, not what it serves), and Pod-specific values (name, UID, IP, worker index) are excluded.
+Admission is computed per **pool** = (role name, role template hash, bootstrap-config hash). Only replicas in the same pool count as sources for each other. For partition-protected ordinals, the role template comes from the ControllerRevision.
 
-The MX plugin persists this hash as `workload.serving.volcano.sh/bootstrap-config-hash` on each created Pod. Admission computes the expected hash with the same helper and counts a replica as a source only when **all** its entry/worker Pods carry matching role-template and configuration hashes. Pods without the annotation, including replicas created before acceleration was enabled, are not sources. The datastore retains the observed identity from Pods, and `syncAll` reconstructs it after restart; it must never substitute the current spec's hash for a missing annotation.
+The **bootstrap-config hash** covers what changes a Pod's MX setup but is not in the role template: provider, whether the role is in scope, `modelExpress.serverAddress`, `modelExpress.engineContainers`, and the user plugin configuration (keys canonicalized, order preserved). `initialSeedReplicas`, `sourceFanOut`, replica counts, `readyURL`, and per-Pod values are excluded.
 
-Changing the endpoint, adding a role to scope, or changing effective plugin configuration leaves existing Pods untouched. New replicas enter the new pool with $R=0$ unless matching sources already exist, rather than using a full fan-out from unconfigured or old-endpoint replicas. Changing only `seedReplicas` or `sourceFanOut` reuses the pool. External changes behind `envFrom` or a stable endpoint are not detectable by this hash; users must roll the affected Pods when source compatibility changes.
+- The MX plugin writes the hash on every Pod as `workload.serving.volcano.sh/bootstrap-config-hash`.
+- A replica is a source only if **all** its Pods carry the expected template and config hashes. Pods without the annotation (for example, created before the feature was enabled) are never sources.
+- `syncAll` rebuilds the hash from Pod annotations, never from the current spec.
 
-Per pool, from the datastore:
+So changing the endpoint, scope, or plugin configuration starts a new pool with $R=0$ (one extra seed batch, never false source reuse), while changing `initialSeedReplicas` or `sourceFanOut` keeps the pool. Changes hidden behind `envFrom` are not detected; users roll the Pods themselves.
 
-- $R$: matching role replicas that are `RoleRunning`.
-- $I$: matching created role replicas that are neither `RoleRunning` nor `Deleting`.
+##### Budget
 
-- $D = \texttt{spec.replicas} \times \texttt{role.replicas}$.
-- $g$: the **gang minimum**, the replicas of this role that one ServingGroup must start together. With a PodGroup, $g = \min(\texttt{role.replicas}, \max(1, \texttt{minRoleReplicas}[r]))$, where `minRoleReplicas[r]` defaults to `role.replicas`. Without a PodGroup, $g = 1$.
-- $S = \min\bigl(D,\ \max(g,\ \lceil \texttt{seedReplicas} \rceil_D)\bigr)$.
+| Symbol | Meaning |
+|---|---|
+| $R$ | Ready sources: replicas in the pool that are `RoleRunning`. |
+| $I$ | In flight: created replicas in the pool that are neither `RoleRunning` nor `Deleting`. |
+| $D$ | Desired replicas: $\texttt{spec.replicas} \times \texttt{role.replicas}$. |
+| $g$ | Gang minimum per ServingGroup: $\min(\texttt{role.replicas}, \max(1, \texttt{minRoleReplicas}[r]))$ with a PodGroup, otherwise 1. |
 
 $$
+S = \min\bigl(D,\ \max(g,\ \texttt{initialSeedReplicas})\bigr) \qquad
 K =
 \begin{cases}
-\max(g,\ \texttt{sourceFanOut} \times R) & R > 0 \\
-S & R = 0
+S & R = 0 \\
+\max(g,\ \texttt{sourceFanOut} \times R) & R > 0
 \end{cases}
 $$
 
-$K$ caps unfinished bootstraps, so the free budget is $K - I$. Replicas that don't fit stay missing until a later reconcile.
+`initialSeedReplicas` defaults to 1, and percentages are rounded up against $D$. The free budget is $K - I$; replicas that don't fit stay missing until a later reconcile.
 
-**Units.** Replicas are created in units that keep gang scheduling satisfiable:
+##### Units
 
-- **New ServingGroup:** its PodGroup plus its **gang core**, i.e. role ordinals $0..g_r-1$ of every in-scope role $r$, plus all replicas of out-of-scope roles. The group's other in-scope role replicas are left for `scaleUpRoles`.
-- **Existing ServingGroup:** if some roles have fewer than $g_r$ non-Deleting replicas (for example after `RoleRecreate`), the replicas missing from the core, across all such roles, form one unit. Every other missing replica (role scale-up, non-core replicas, `RoleRollingUpdate`) is a unit of one.
-- A unit is admitted only if it fits in every in-scope pool it touches: $u_p \le K_p - I_p$, where $u_p$ is the unit's replicas in pool $p$. Its replicas are then added to $I_p$. Out-of-scope pools are not limited.
+Replicas are admitted in units, so that gang scheduling stays satisfiable:
 
-**Order:** lowest missing ordinal first, which matches `forEachMissingOrdinal`. Once a unit is denied, every later unit that touches one of its pools is denied for the rest of the reconcile, so a smaller unit never overtakes a gang core and starves it.
+- **New ServingGroup:** its PodGroup plus its **gang core** (ordinals $0..g_r-1$ of each in-scope role) plus all out-of-scope replicas. `scaleUpRoles` adds the rest later.
+- **Existing group missing part of its core** (for example after `RoleRecreate`): the missing core replicas form one unit.
+- **Any other missing replica:** a unit of one.
+
+A unit is admitted only if it fits in every in-scope pool it touches ($u_p \le K_p - I_p$); out-of-scope roles are not limited. Units go in lowest-ordinal order. Once a unit is denied, later units touching the same pool are also denied in this reconcile, so small units cannot starve a gang core.
 
 ##### Fan-out and gang
 
-`sourceFanOut` is a per-pool ratio of starting replicas to ready sources. A gang core is the smallest thing that can be scheduled. When the two disagree, the gang wins:
+When `sourceFanOut` and the gang core disagree, the gang wins:
 
-- **Floor.** $K \ge g$ and $S \ge g$. Without the floor, a pool whose missing replicas are all gang cores would deadlock whenever $\texttt{sourceFanOut} \times R < g$, since no core could be admitted and $R$ could never grow. The cost is that one core may start with more replicas than the fan-out allows. For example, with $g = 4$, $R = 1$, and `sourceFanOut: 1`, all 4 replicas pull from 1 source.
-- **Whole units only.** A unit is admitted only if it fits in every in-scope pool; admission never increases $I$ above the current $K$. If sources become unready or the policy lowers $K$ below the existing $I$, no new replicas are admitted until enough in-flight replicas finish. Once $I_p \to 0$, every unit fits, because $u_p \le g_p \le K_p$.
-- **Per role.** A multi-role core needs room in each pool. Each role counts only its own replicas as sources, even when MX could match them across roles. This is conservative.
-- **Aggregate, not per source.** The controller uses $K = \max(g, \texttt{sourceFanOut} \times R)$ when $R>0$, not a per-source reader limit. MX picks a source for each reader (randomly by default). `MX_P2P_SOURCE_SELECTOR=rendezvous_hash` can improve distribution but does not guarantee an even spread or enforce a hard per-source cap.
-- **Relationship to `minRoleReplicas`.** `minRoleReplicas` is a per-ServingGroup scheduling requirement, while `seedReplicas` is a per-pool cold-start budget across groups. The former sets a lower bound on the latter's effective value, not an additional batch limit. For example, with $g=2$ and `seedReplicas: 3`, one new group gets its 2-replica core; another whole core cannot fit in the remaining budget. The default `seedReplicas: 1` remains valid even if $g>1$, and the runtime floor handles both integers and percentages.
-- **Tip:** a lower `minRoleReplicas` shrinks the core, so fewer replicas cold start and the fan-out is exceeded less.
+- **Floor:** $S, K \ge g$. Otherwise no core could start while $\texttt{sourceFanOut} \times R < g$. The cost is that one core may exceed the fan-out (for example, $g=4$, $R=1$, `sourceFanOut: 1` puts 4 readers on 1 source).
+- **No overshoot:** admission never pushes $I$ above $K$. If $K$ drops below $I$ (sources lost or policy lowered), creation pauses until in-flight replicas finish.
+- **Per role:** each role counts only its own sources, and a multi-role core needs room in every pool.
+- **Aggregate cap:** $K$ limits the pool total, not each source. MX picks the source for each reader (randomly by default; `MX_P2P_SOURCE_SELECTOR=rendezvous_hash` spreads better), so one source may serve more than `sourceFanOut` readers.
+- **`minRoleReplicas`** only raises the effective seed budget. Lowering it shrinks the core and reduces cold starts.
 
-**Example.** Prefill/decode (PD), `replicas: 4`, each group has 2 prefill + 4 decode, `minRoleReplicas: {prefill: 1, decode: 2}`, so $g_P = 1$ and $g_D = 2$. `seedReplicas: 1` and `sourceFanOut: 1`; the effective cold-start budgets are 1P and 2D because gang scheduling takes precedence.
+**Example.** Prefill/decode (PD), `replicas: 4`, each group has 2 prefill + 4 decode, `minRoleReplicas: {prefill: 1, decode: 2}` ($g_P = 1$, $g_D = 2$), default `initialSeedReplicas: 1`, `sourceFanOut: 1`. The gang floor raises the seed budgets to 1P and 2D.
 
 | Batch | $(R_P, R_D)$ | $(K_P, K_D)$ | Created |
 |---|---|---|---|
@@ -297,9 +313,9 @@ Storage serves 3 cold loads instead of 24.
 
 | Policy | Batches |
 |---|---|
-| `seedReplicas: 1`, `sourceFanOut: 1` | 1 → 2 → 4 → 8 |
-| `seedReplicas: 1`, `sourceFanOut: 2` | 1 → 3 → 8 |
-| `seedReplicas: 1`, `sourceFanOut: 3` | 1 → 4 → 8 |
+| `initialSeedReplicas: 1`, `sourceFanOut: 1` | 1 → 2 → 4 → 8 |
+| `initialSeedReplicas: 1`, `sourceFanOut: 2` | 1 → 3 → 8 |
+| `initialSeedReplicas: 1`, `sourceFanOut: 3` | 1 → 4 → 8 |
 | Scale 8 → 16, `sourceFanOut: 1` | 8 → 16 |
 
 #### 3. Rolling update
@@ -309,7 +325,7 @@ Storage serves 3 cold loads instead of 24.
 **R1. A changed role template or effective bootstrap configuration is a new pool.** It starts with a first batch of $S$; replicas with different template or configuration hashes are not counted in its $R$.
 
 - Why not share sources across revisions: MX matches sources by `SourceIdentity` (model, revision, TP/PP/EP, dtype, quantization, engine/torch/CUDA versions, GPU arch). The controller can't tell from a template diff whether that identity changed. Counting incompatible old replicas would release a large batch that all falls back to storage.
-- If the change is identity-neutral (for example, resources, probes, `--max-num-seqs`), the new pool's first batch still finds old-revision sources through MX and loads P2P. The only cost is that the first batch is `seedReplicas` wide.
+- If the change is identity-neutral (for example, resources, probes, `--max-num-seqs`), the new pool's first batch still finds old-revision sources through MX and loads P2P. The only cost is that the first batch is the role's `initialSeedReplicas` wide.
 - Roles whose template and effective configuration didn't change keep their pool. Under `ServingGroupRollingUpdate`, their re-created replicas join the existing pool (usually $R > 0$) and are admitted with its budget.
 
 **R2. Pacing stays with the rollout.** A deferred group is absent from the datastore, which lowers `len(groups)` in `maxScaleDown` exactly as one unavailable new group would. `maxUnavailable` is never exceeded.
@@ -326,7 +342,7 @@ Storage serves 3 cold loads instead of 24.
 
 **R6. `RoleRollingUpdate`.** The same rules apply per role, and unchanged roles are not touched. In PD disaggregation, updating only `prefill` restarts from a first batch only in the prefill pool.
 
-**Example.** `replicas: 8`, `maxUnavailable: 2`, `maxSurge: 0`, `seedReplicas: 1`, `sourceFanOut: 1`, new engine image:
+**Example.** `replicas: 8`, `maxUnavailable: 2`, `maxSurge: 0`, `initialSeedReplicas: 1`, `sourceFanOut: 1`, new engine image:
 
 1. The rollout deletes groups 7 and 6. The new pool has $R=0$, so only group 6 is created, and 7 stays missing. `maxScaleDown` = 7 − 6 − 1 = 0.
 2. Group 6 is Running, so $R=1$ and group 7 is created. `maxScaleDown` = 8 − 6 − 1 = 1, and group 5 is deleted.
@@ -396,12 +412,12 @@ The injection happens at Pod creation, so changing `serverAddress` affects only 
 
 Unit tests (table-driven, `-race` where concurrent):
 
-- **Admitter:** $S$/$K$ with integer and percentage seeds, the gang floor $g$, $D=0$, whole-unit fit across pools, blocking after a denied unit, $I > K$ after sources become unready or the policy is lowered, and the batch sequences in the examples above.
+- **Admitter:** $S$/$K$ with per-role integer and percentage seeds, the default of 1 when `roles` is empty or a seed is unset, the gang floor $g$, $D=0$, whole-unit fit across pools, blocking after a denied unit, $I > K$ after sources become unready or the policy is lowered, and the batch sequences in the examples above.
 - **Pool identity:** the configuration hash is stable under plugin JSON key reordering and changes with the endpoint, scope, engine containers, and plugin configuration; replicas with missing or mismatched annotations are not sources; `syncAll` rebuilds the observed hash without substituting the current spec's.
 - **Controller:** new-group core creation with its PodGroup, core-deficit units, units of one, out-of-scope roles ungated, a failed unit render creating nothing, disabling the policy, and rolling-update pacing (`maxUnavailable`, `maxSurge`, `partition`, rollback).
 - **Revision neutrality:** adding, editing, or removing the strategy does not change `ModelServingRevision`, `CalRoleTemplateHash`, or `BuildRevisionData`.
 - **Environment injection:** only selected engine containers change; init containers and sidecars are untouched; `readyURL` maps to `MX_ARTIFACT_READY_URL`; existing `MX_SERVER_ADDRESS`, `MX_ARTIFACT_READY_URL`, and other variables win; changing `readyURL` keeps the pool; nothing is injected when `modelExpress` is omitted; `MODEL_EXPRESS_URL` and MX defaults are never injected.
-- **Webhook:** unknown roles, invalid `seedReplicas`, malformed `serverAddress` or `readyURL`, missing engine containers in templates, and explicit registration of the managed plugin.
+- **Webhook:** unknown or duplicate `roles[].name`, invalid `roles[].initialSeedReplicas`, malformed `serverAddress` or `readyURL`, missing engine containers in templates, and explicit registration of the managed plugin.
 
 E2E (`test/e2e/controller-manager`): a multi-replica ModelServing with the strategy and a stub engine (no MX needed) verifies batch order, gang cores with `schedulerName: volcano`, and a rolling update.
 
