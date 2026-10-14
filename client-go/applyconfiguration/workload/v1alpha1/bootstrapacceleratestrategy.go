@@ -20,7 +20,6 @@ package v1alpha1
 
 import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
-	intstr "k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // BootstrapAccelerateStrategyApplyConfiguration represents a declarative configuration of the BootstrapAccelerateStrategy type for use
@@ -30,16 +29,14 @@ import (
 type BootstrapAccelerateStrategyApplyConfiguration struct {
 	// Provider is the weight transfer system used by the inference engines.
 	Provider *workloadv1alpha1.BootstrapAccelerateStrategyProvider `json:"provider,omitempty"`
-	// Roles limits acceleration to the named roles. Empty means all roles.
-	Roles []string `json:"roles,omitempty"`
-	// SeedReplicas limits role replicas created per pool while no ready source
-	// exists. It is a positive integer or a percentage from 1% to 100% of
-	// spec.replicas * role.replicas, rounded up (10% of 3 is 1).
-	// The effective budget is at least the role's gang minimum in one ServingGroup.
-	// A desired count of zero creates nothing.
-	SeedReplicas *intstr.IntOrString `json:"seedReplicas,omitempty"`
-	// SourceFanOut limits starting role replicas per ready replica in the same
-	// pool. The effective budget is at least the role's gang minimum.
+	// Roles limits acceleration to the listed roles and configures each of them.
+	// Empty means all roles with default settings.
+	Roles []BootstrapRoleApplyConfiguration `json:"roles,omitempty"`
+	// SourceFanOut is the number of P2P targets that one source can serve, i.e.
+	// starting role replicas (created but not yet Running) per ready replica of
+	// the same role. Once a role replica becomes ready, it acts as a new source
+	// for the other replicas of that role, so the budget grows as more replicas
+	// become ready. The effective budget is at least the role's gang minimum.
 	SourceFanOut *int32 `json:"sourceFanOut,omitempty"`
 	// ModelExpress configures environment injection for inference engines.
 	// If unset, users configure the engine environment themselves.
@@ -63,18 +60,13 @@ func (b *BootstrapAccelerateStrategyApplyConfiguration) WithProvider(value workl
 // WithRoles adds the given value to the Roles field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the Roles field.
-func (b *BootstrapAccelerateStrategyApplyConfiguration) WithRoles(values ...string) *BootstrapAccelerateStrategyApplyConfiguration {
+func (b *BootstrapAccelerateStrategyApplyConfiguration) WithRoles(values ...*BootstrapRoleApplyConfiguration) *BootstrapAccelerateStrategyApplyConfiguration {
 	for i := range values {
-		b.Roles = append(b.Roles, values[i])
+		if values[i] == nil {
+			panic("nil value passed to WithRoles")
+		}
+		b.Roles = append(b.Roles, *values[i])
 	}
-	return b
-}
-
-// WithSeedReplicas sets the SeedReplicas field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the SeedReplicas field is set to the value of the last call.
-func (b *BootstrapAccelerateStrategyApplyConfiguration) WithSeedReplicas(value intstr.IntOrString) *BootstrapAccelerateStrategyApplyConfiguration {
-	b.SeedReplicas = &value
 	return b
 }
 

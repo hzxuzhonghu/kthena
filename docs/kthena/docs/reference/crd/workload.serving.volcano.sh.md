@@ -201,9 +201,8 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `provider` _[BootstrapAccelerateStrategyProvider](#bootstrapacceleratestrategyprovider)_ | Provider is the weight transfer system used by the inference engines. | ModelExpress | Enum: [ModelExpress] <br /> |
-| `roles` _string array_ | Roles limits acceleration to the named roles. Empty means all roles. |  |  |
-| `seedReplicas` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | SeedReplicas limits role replicas created per pool while no ready source<br />exists. It is a positive integer or a percentage from 1% to 100% of<br />spec.replicas * role.replicas, rounded up (10% of 3 is 1).<br />The effective budget is at least the role's gang minimum in one ServingGroup.<br />A desired count of zero creates nothing. | 1 | XIntOrString: \{\} <br /> |
-| `sourceFanOut` _integer_ | SourceFanOut limits starting role replicas per ready replica in the same<br />pool. The effective budget is at least the role's gang minimum. | 1 | Minimum: 1 <br /> |
+| `roles` _[BootstrapRole](#bootstraprole) array_ | Roles limits acceleration to the listed roles and configures each of them.<br />Empty means all roles with default settings. |  |  |
+| `sourceFanOut` _integer_ | SourceFanOut is the number of P2P targets that one source can serve, i.e.<br />starting role replicas (created but not yet Running) per ready replica of<br />the same role. Once a role replica becomes ready, it acts as a new source<br />for the other replicas of that role, so the budget grows as more replicas<br />become ready. The effective budget is at least the role's gang minimum. | 1 | Minimum: 1 <br /> |
 | `modelExpress` _[ModelExpressConfig](#modelexpressconfig)_ | ModelExpress configures environment injection for inference engines.<br />If unset, users configure the engine environment themselves. |  |  |
 
 
@@ -222,6 +221,23 @@ _Appears in:_
 | Field | Description |
 | --- | --- |
 | `ModelExpress` |  |
+
+
+#### BootstrapRole
+
+
+
+BootstrapRole configures bootstrap acceleration for one role.
+
+
+
+_Appears in:_
+- [BootstrapAccelerateStrategy](#bootstrapacceleratestrategy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | Name is the name of a role in spec.template.roles. |  | MinLength: 1 <br /> |
+| `initialSeedReplicas` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | InitialSeedReplicas is the number of this role's replicas that may be<br />created while no ready source exists for it. It is a positive integer or a<br />percentage from 1% to 100% of spec.replicas * role.replicas, rounded up<br />(10% of 3 is 1). The effective budget is at least the role's gang minimum<br />in one ServingGroup. A desired count of zero creates nothing. | 1 | XIntOrString: \{\} <br /> |
 
 
 #### DisaggregatedScalingStatus

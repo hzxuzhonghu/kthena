@@ -95,24 +95,18 @@ type BootstrapAccelerateStrategy struct {
 	// +optional
 	Provider BootstrapAccelerateStrategyProvider `json:"provider,omitempty"`
 
-	// Roles limits acceleration to the named roles. Empty means all roles.
-	// +listType=set
+	// Roles limits acceleration to the listed roles and configures each of them.
+	// Empty means all roles with default settings.
+	// +listType=map
+	// +listMapKey=name
 	// +optional
-	Roles []string `json:"roles,omitempty"`
+	Roles []BootstrapRole `json:"roles,omitempty"`
 
-	// SeedReplicas limits role replicas created per pool while no ready source
-	// exists. It is a positive integer or a percentage from 1% to 100% of
-	// spec.replicas * role.replicas, rounded up (10% of 3 is 1).
-	// The effective budget is at least the role's gang minimum in one ServingGroup.
-	// A desired count of zero creates nothing.
-	// +kubebuilder:validation:XIntOrString
-	// +kubebuilder:validation:XValidation:rule="type(self) == int ? self >= 1 : self.matches('^([1-9]|[1-9][0-9]|100)%$')",message="seedReplicas must be a positive integer or a percentage from 1% to 100%"
-	// +kubebuilder:default=1
-	// +optional
-	SeedReplicas *intstr.IntOrString `json:"seedReplicas,omitempty"`
-
-	// SourceFanOut limits starting role replicas per ready replica in the same
-	// pool. The effective budget is at least the role's gang minimum.
+	// SourceFanOut is the number of P2P targets that one source can serve, i.e.
+	// starting role replicas (created but not yet Running) per ready replica of
+	// the same role. Once a role replica becomes ready, it acts as a new source
+	// for the other replicas of that role, so the budget grows as more replicas
+	// become ready. The effective budget is at least the role's gang minimum.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
 	// +optional
@@ -122,6 +116,24 @@ type BootstrapAccelerateStrategy struct {
 	// If unset, users configure the engine environment themselves.
 	// +optional
 	ModelExpress *ModelExpressConfig `json:"modelExpress,omitempty"`
+}
+
+// BootstrapRole configures bootstrap acceleration for one role.
+type BootstrapRole struct {
+	// Name is the name of a role in spec.template.roles.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// InitialSeedReplicas is the number of this role's replicas that may be
+	// created while no ready source exists for it. It is a positive integer or a
+	// percentage from 1% to 100% of spec.replicas * role.replicas, rounded up
+	// (10% of 3 is 1). The effective budget is at least the role's gang minimum
+	// in one ServingGroup. A desired count of zero creates nothing.
+	// +kubebuilder:validation:XIntOrString
+	// +kubebuilder:validation:XValidation:rule="type(self) == int ? self >= 1 : self.matches('^([1-9]|[1-9][0-9]|100)%$')",message="initialSeedReplicas must be a positive integer or a percentage from 1% to 100%"
+	// +kubebuilder:default=1
+	// +optional
+	InitialSeedReplicas *intstr.IntOrString `json:"initialSeedReplicas,omitempty"`
 }
 
 // ModelExpressConfig configures the ModelExpress inference-engine containers.

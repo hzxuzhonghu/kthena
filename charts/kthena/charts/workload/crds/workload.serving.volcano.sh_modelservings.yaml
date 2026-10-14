@@ -103,33 +103,48 @@ spec:
                     - ModelExpress
                     type: string
                   roles:
-                    description: Roles limits acceleration to the named roles. Empty
-                      means all roles.
-                    items:
-                      type: string
-                    type: array
-                    x-kubernetes-list-type: set
-                  seedReplicas:
-                    anyOf:
-                    - type: integer
-                    - type: string
-                    default: 1
                     description: |-
-                      SeedReplicas limits role replicas created per pool while no ready source
-                      exists. It is a positive integer or a percentage from 1% to 100% of
-                      spec.replicas * role.replicas, rounded up (10% of 3 is 1).
-                      The effective budget is at least the role's gang minimum in one ServingGroup.
-                      A desired count of zero creates nothing.
-                    x-kubernetes-int-or-string: true
-                    x-kubernetes-validations:
-                    - message: seedReplicas must be a positive integer or a percentage
-                        from 1% to 100%
-                      rule: 'type(self) == int ? self >= 1 : self.matches(''^([1-9]|[1-9][0-9]|100)%$'')'
+                      Roles limits acceleration to the listed roles and configures each of them.
+                      Empty means all roles with default settings.
+                    items:
+                      description: BootstrapRole configures bootstrap acceleration
+                        for one role.
+                      properties:
+                        initialSeedReplicas:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          default: 1
+                          description: |-
+                            InitialSeedReplicas is the number of this role's replicas that may be
+                            created while no ready source exists for it. It is a positive integer or a
+                            percentage from 1% to 100% of spec.replicas * role.replicas, rounded up
+                            (10% of 3 is 1). The effective budget is at least the role's gang minimum
+                            in one ServingGroup. A desired count of zero creates nothing.
+                          x-kubernetes-int-or-string: true
+                          x-kubernetes-validations:
+                          - message: initialSeedReplicas must be a positive integer
+                              or a percentage from 1% to 100%
+                            rule: 'type(self) == int ? self >= 1 : self.matches(''^([1-9]|[1-9][0-9]|100)%$'')'
+                        name:
+                          description: Name is the name of a role in spec.template.roles.
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
                   sourceFanOut:
                     default: 1
                     description: |-
-                      SourceFanOut limits starting role replicas per ready replica in the same
-                      pool. The effective budget is at least the role's gang minimum.
+                      SourceFanOut is the number of P2P targets that one source can serve, i.e.
+                      starting role replicas (created but not yet Running) per ready replica of
+                      the same role. Once a role replica becomes ready, it acts as a new source
+                      for the other replicas of that role, so the budget grows as more replicas
+                      become ready. The effective budget is at least the role's gang minimum.
                     format: int32
                     minimum: 1
                     type: integer
