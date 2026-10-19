@@ -122,10 +122,6 @@ spec:
                             (10% of 3 is 1). The effective budget is at least the role's gang minimum
                             in one ServingGroup. A desired count of zero creates nothing.
                           x-kubernetes-int-or-string: true
-                          x-kubernetes-validations:
-                          - message: initialSeedReplicas must be a positive integer
-                              or a percentage from 1% to 100%
-                            rule: 'type(self) == int ? self >= 1 : self.matches(''^([1-9]|[1-9][0-9]|100)%$'')'
                         name:
                           description: Name is the name of a role in spec.template.roles.
                           minLength: 1

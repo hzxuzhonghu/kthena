@@ -130,7 +130,6 @@ type BootstrapRole struct {
 	// (10% of 3 is 1). The effective budget is at least the role's gang minimum
 	// in one ServingGroup. A desired count of zero creates nothing.
 	// +kubebuilder:validation:XIntOrString
-	// +kubebuilder:validation:XValidation:rule="type(self) == int ? self >= 1 : self.matches('^([1-9]|[1-9][0-9]|100)%$')",message="initialSeedReplicas must be a positive integer or a percentage from 1% to 100%"
 	// +kubebuilder:default=1
 	// +optional
 	InitialSeedReplicas *intstr.IntOrString `json:"initialSeedReplicas,omitempty"`
